@@ -32,13 +32,13 @@ def main():
     hw = highway.fetch_i90()
 
     print("\n==[6/7] first-row classification (profile to I-90) ==")
-    classified = profile_clf.classify(dem_path=config.DEM_TIF, highway=hw, peaks=ours)
+    classified, details = profile_clf.classify(dem_path=config.DEM_TIF, highway=hw, peaks=ours)
     classified.to_file(config.RESULT_GPKG, driver="GPKG")
     print(f"  wrote {config.RESULT_GPKG}")
 
     print("\n==[7/7] map + exports ==")
     viz.make_map(classified, hw)
-    webapp.build_app(classified, hw)
+    webapp.build_app(classified, hw, details=details)
     export.export_all(classified)
 
     n_fr = int(classified.frontrow.sum())
