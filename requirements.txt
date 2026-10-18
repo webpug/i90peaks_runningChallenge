@@ -1,17 +1,12 @@
-# Pinned constraints that matter (richdem needs numpy<2 and pkg_resources<80).
 # Recreate the env with:  uv venv --python 3.10 .venv && uv pip install -r requirements.txt
 numpy<2
-richdem==0.3.4
-setuptools<80
-
+numba
 rasterio
-rioxarray
-xarray
 scipy
 geopandas
 shapely
 pyproj
-osmnx>=2
+pyarrow
 requests
 matplotlib
 folium
@@ -19,4 +14,5 @@ tqdm
 pandas
 mercantile
 pillow
-networkx
+scikit-learn
+fitparse

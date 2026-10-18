@@ -43,3 +43,17 @@ def report(ours, kirmse=None) -> None:
         print(f"  {k:>22}: {v}")
     print(f"  ({s['kirmse_unmatched']} Kirmse peaks with no computed match within 300 m "
           f"-- likely resolution/edge differences)")
+
+
+def reconcile(ours, kirmse, match_radius_m: float = 300.0):
+    """Final qualifying set: our peaks >= PROM_MIN_FT, plus our near-threshold peaks
+    that Kirmse independently puts at >= PROM_MIN_FT. Adds `prom_kirmse_ft`."""
+    tree = cKDTree(_xy(kirmse))
+    dist, idx = tree.query(_xy(ours), k=1)
+    hit = dist <= match_radius_m
+    ours = ours.copy()
+    ours["prom_kirmse_ft"] = np.where(hit, kirmse["prom_ft"].to_numpy()[idx], np.nan)
+    keep = (ours.prom_ft >= config.PROM_MIN_FT) | (ours.prom_kirmse_ft >= config.PROM_MIN_FT)
+    added = int((keep & (ours.prom_ft < config.PROM_MIN_FT)).sum())
+    print(f"[reconcile] {int(keep.sum())} qualifying peaks ({added} near-threshold rescued by Kirmse)")
+    return ours[keep].reset_index(drop=True)

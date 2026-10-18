@@ -20,11 +20,19 @@ from pathlib import Path
 WEST, SOUTH, EAST, NORTH = -122.40, 46.75, -119.80, 47.75
 BBOX = (WEST, SOUTH, EAST, NORTH)  # (left, bottom, right, top)
 
+# The challenge ends at the Columbia: I-90 is clipped at the Vantage bridge and
+# peaks on the east bank are out of scope.
+COLUMBIA_LON = -119.975
+
 # ---------------------------------------------------------------------------
 # Thresholds
 # ---------------------------------------------------------------------------
 PROM_MIN_FT = 250.0          # minimum topographic prominence to consider a peak
 PROM_MIN_M = PROM_MIN_FT * 0.3048
+# Our 26 m DEM measures prominence to ~+/-40 ft. Peaks we compute in
+# [PROM_SEARCH_FT, PROM_MIN_FT) are kept only if the Kirmse reference puts them
+# at >= PROM_MIN_FT (e.g. Mount Si), so near-threshold summits aren't lost.
+PROM_SEARCH_FT = 180.0
 
 # How far from a peak (in DEM cells) to search for the true local-max cell when
 # snapping a Kirmse coordinate onto our DEM grid.
@@ -70,3 +78,5 @@ PEAKS_CORRIDOR = INTERIM / "peaks_corridor.gpkg"     # filtered to bbox + prom
 HIGHWAY_GPKG = INTERIM / "i90_centerline.gpkg"
 RESULT_GPKG = PROCESSED / "peaks_classified.gpkg"    # front-row vs occluded
 RESULT_MAP = PROCESSED / "i90_frontrow_map.html"
+CAPS_GPKG = PROCESSED / "summit_caps.gpkg"           # top-250 ft footprint per peak
+DETAILS_PKL = INTERIM / "approach_details.pkl"     # per-peak approach line + profile
