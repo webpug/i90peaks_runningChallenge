@@ -12,8 +12,9 @@ The raster is written as an index PNG: each pixel's RGB holds (peak index + 1) a
 r*65536 + g*256 + b, 0 = no island, where the peak index is the row of the
 classified table (= the map's feature id). The map colours it by prominence in
 the browser and reads it back on hover, so one file gives both the picture and
-"whose ground is this". It is aligned to the DEM's Web Mercator grid, which is
-what Leaflet's imageOverlay expects.
+"whose ground is this". `parent` records which bigger island each island sits
+inside, so the map can outline a peak's whole island. It is aligned to the DEM's
+Web Mercator grid, which is what Leaflet's imageOverlay expects.
 """
 from __future__ import annotations
 
@@ -57,6 +58,7 @@ def build(classified, dem_path=config.DEM_TIF):
     to_dem = Transformer.from_crs("EPSG:4326", crs, always_xy=True)
 
     owner = np.zeros(elev.shape, dtype=np.int32)
+    parent = [-1] * len(classified)   # the next-bigger island each island sits inside
     # biggest first, so nested (smaller) islands overwrite the ones they sit in
     order = classified.reset_index(drop=True).sort_values("prom_ft", ascending=False)
     n = 0
@@ -66,6 +68,7 @@ def build(classified, dem_path=config.DEM_TIF):
         x, y = to_dem.transform(p.lon, p.lat)
         r, c = rasterio.transform.rowcol(transform, x, y)
         col_m = float(elev[r, c]) - float(p.prom_ft) * 0.3048
+        parent[i] = int(owner[r, c]) - 1   # bigger islands are already painted
         (r0, c0), comp = _island(elev, r, c, col_m)
         owner[r0:r0 + comp.shape[0], c0:c0 + comp.shape[1]][comp] = i + 1
         n += 1
@@ -77,7 +80,7 @@ def build(classified, dem_path=config.DEM_TIF):
     to_wgs = Transformer.from_crs(crs, "EPSG:4326", always_xy=True)
     w, s = to_wgs.transform(bounds.left, bounds.bottom)
     e, nn = to_wgs.transform(bounds.right, bounds.top)
-    meta = {"bounds": [[s, w], [nn, e]], "size": [small.shape[1], small.shape[0]]}
+    meta = {"bounds": [[s, w], [nn, e]], "size": [small.shape[1], small.shape[0]], "parent": parent}
     OUT_JSON.write_text(json.dumps(meta))
     print(f"[promraster] {n} islands, {(small > 0).mean():.0%} of the frame covered -> "
           f"{OUT_PNG} ({OUT_PNG.stat().st_size / 1e6:.1f} MB)")

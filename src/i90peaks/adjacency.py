@@ -197,11 +197,16 @@ def classify(dem_path=config.DEM_TIF, highway=None, peaks=None, tol_m=TOL_M,
             js = np.concatenate([near, rest[np.linspace(0, len(rest) - 1,
                                                         max_candidates - len(near)).astype(int)]])
         best = first = None
+        tally, cap_hits = {}, {}         # what stopped each line tried (shown on the map)
         for j in js:
             r0, c0 = cand_rc[j]
             st, k, n, who = _walk(elev, cap, valid, r0, c0, float(srow[i]), float(scol[i]),
                                   i + 1, float(selev[i]), 30.0, float(tol_m))
             rec = (st, k, n, who, j)
+            kind = {0: "peak", 1: "ok", 2: "higher", 3: "nodata", 4: "ridge"}[st]
+            tally[kind] = tally.get(kind, 0) + 1
+            if st == 0:
+                cap_hits[int(who) - 1] = cap_hits.get(int(who) - 1, 0) + 1
             if first is None:
                 first = rec
             if st == 1:
@@ -232,6 +237,9 @@ def classify(dem_path=config.DEM_TIF, highway=None, peaks=None, tol_m=TOL_M,
                 "ok": ok,
                 "by": blocked_by[-1],
                 "kind": block_kind[-1],
+                "tried": sum(tally.values()),
+                "tally": tally,
+                "caps": sorted(cap_hits.items(), key=lambda kv: -kv[1])[:4],
             })
 
     out = peaks.copy()

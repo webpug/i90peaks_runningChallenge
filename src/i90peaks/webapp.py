@@ -158,7 +158,7 @@ input[type=search]{width:100%;border:1px solid var(--line);background:var(--pane
 .btn:hover{border-color:var(--front)}
 .foot .sp{flex:1}
 #card{position:absolute;right:16px;top:16px;width:360px;max-width:calc(100% - 32px);background:var(--panel);
-  border-radius:16px;box-shadow:var(--shadow);padding:16px 18px;z-index:500;display:none;border:1px solid var(--line)}
+  border-radius:16px;box-shadow:var(--shadow);padding:16px 18px;z-index:500;display:none;max-height:calc(100% - 32px);overflow:auto;box-sizing:border-box;border:1px solid var(--line)}
 #card h2{font-family:Fraunces,serif;font-size:22px;margin:0 28px 2px 0;line-height:1.15}
 #card .x{position:absolute;right:12px;top:10px;border:0;background:none;color:var(--muted);font-size:20px;cursor:pointer}
 .kv{display:flex;gap:16px;margin:8px 0 10px}
@@ -203,7 +203,18 @@ input[type=search]{width:100%;border:1px solid var(--line);background:var(--pane
 .mid:hover{opacity:.9}
 .drawing #map{cursor:crosshair}
 .kbd{font-size:11px;color:var(--muted)}
-#promInfo{position:absolute;left:56px;bottom:24px;z-index:500;display:none;max-width:290px;background:var(--panel);
+#card .step{font-size:10px;font-weight:600;letter-spacing:.09em;text-transform:uppercase;color:var(--muted);margin:14px 0 4px}
+#card .marks{font-size:11.5px;color:var(--muted);margin:4px 0 0;padding-left:18px;line-height:1.45}
+#card div.marks{padding-left:0}
+.bmark{background:#c0392b;color:#fff;border:2px solid #fff;border-radius:50%;font:600 10px/14px Inter,sans-serif;text-align:center;box-sizing:border-box}
+.hintflag span{position:relative;display:inline-block;background:var(--ink);color:var(--panel);font:600 11.5px Inter,sans-serif;padding:5px 9px;border-radius:9px;white-space:nowrap;box-shadow:var(--shadow);cursor:pointer}
+.hintflag span:after{content:'';position:absolute;left:0;top:100%;width:2px;height:9px;background:var(--ink)}
+.hintflag span:hover{background:var(--front)}
+#piNow{color:var(--ink)}
+.pi-tip{margin-top:2px}
+#promInfo details{margin-top:6px;line-height:1.4}
+#promInfo summary{cursor:pointer;color:var(--ink)}
+#promInfo{position:absolute;left:56px;bottom:24px;z-index:450;display:none;max-width:290px;background:var(--panel);
   border:1px solid var(--line);border-radius:12px;padding:8px 10px;box-shadow:var(--shadow);font-size:11.5px;color:var(--muted)}
 #promInfo b{color:var(--ink)}
 #promInfo .ramp{display:flex;margin:6px 0 2px;border-radius:4px;overflow:hidden}
@@ -371,7 +382,7 @@ function render(){
     const m=L.circleMarker([c[1],c[0]],{radius:radius(p.prom_ft),color:p.front?'#fff':col,weight:p.front?1.5:1,
       fillColor:col,fillOpacity:p.front?.95:.55});
     m.bindTooltip(`<b>${nameOf(p)}</b><br>${fmt(p.elev_ft)} ft · P${fmt(p.prom_ft)}`,{direction:'top',offset:[0,-4]});
-    m.on('click',()=>{if(!drawing) select(p.id,false);});
+    m.on('click',()=>{suppressClick=Date.now();if(!drawing) select(p.id,false);});
     m.addTo(peakLayer);});
   const sorted=[...vis].sort((a,b)=>b.properties.prom_ft-a.properties.prom_ft);
   document.getElementById('list').innerHTML=sorted.map(f=>{const p=f.properties;
@@ -391,59 +402,242 @@ const capsOn=()=>document.getElementById('t_caps').checked&&map.getZoom()>=11;
 const syncCaps=()=>capsOn()?capLayer.addTo(map):map.removeLayer(capLayer);
 map.on('zoomend',syncCaps);document.getElementById('t_caps').addEventListener('change',syncCaps);syncCaps();tog('t_tracks',trackLayer);tog('t_routes',routeLayer);tog('t_drawn',drawnLayer);
 
-// ---- prominence islands: an index PNG (pixel RGB = peak id + 1, see promraster.py),
-// coloured here by prominence and read back on hover to name the peak that owns the ground
+// ---- prominence islands + point check
+// Index PNG (pixel RGB = peak id + 1, see promraster.py): coloured here by the owning
+// peak's prominence, read back on hover ("whose ground is this"), and outlined to show
+// a peak's whole island (its own ground plus every island nested in it).
 const PROM_STOPS=[250,400,600,1000,2000,4000];
 const PROM_COLS=['#fcfdbf','#feb078','#f1605d','#b63679','#721f81','#2c115f'];
 const promCol=v=>{let k=0;while(k<PROM_STOPS.length-1&&v>=PROM_STOPS[k+1])k++;return PROM_COLS[k];};
-let promLayer=null,promIdx=null,promOpacity=.6;
+const TOL_M=76.2;            // 250 ft, the rule's threshold
+const PAR=D.prom?.parent||[];
+let promLayer=null,promIdx=null,promCtx=null,promBase=null,promBox=null,promOpacity=.6,outlined=-1,outlineBox=null;
 map.createPane('prom').style.zIndex=350;          // under the routes and markers
+// Leaflet's ImageOverlay only takes an <img>; this lets it place a canvas we can redraw in place
+const CanvasOverlay=L.ImageOverlay.extend({_initImage(){const c=this._image=this._url;
+  L.DomUtil.addClass(c,'leaflet-image-layer');if(this._zoomAnimated)L.DomUtil.addClass(c,'leaflet-zoom-animated');
+  c.onselectstart=L.Util.falseFn;c.onmousemove=L.Util.falseFn;this._updateOpacity();}});
 async function loadProm(){
   const img=new Image();
   img.src=/\.html$/.test(location.pathname)?'prominence.png':'/i90peaks/prominence.png';
   await img.decode();
   const [w,h]=[img.width,img.height],cv=document.createElement('canvas');cv.width=w;cv.height=h;
-  const cx=cv.getContext('2d',{willReadFrequently:true});cx.drawImage(img,0,0);
-  const px=cx.getImageData(0,0,w,h),d=px.data;promIdx=new Int32Array(w*h);
+  promCtx=cv.getContext('2d',{willReadFrequently:true});promCtx.drawImage(img,0,0);
+  const px=promCtx.getImageData(0,0,w,h),d=px.data;promIdx=new Int32Array(w*h);
   const lut=P.map(f=>{const c=promCol(f.properties.prom_ft);return [1,3,5].map(i=>parseInt(c.slice(i,i+2),16));});
+  promBox=P.map(()=>[1e9,1e9,-1,-1]);
   for(let i=0,j=0;i<promIdx.length;i++,j+=4){
     const id=(d[j]<<16|d[j+1]<<8|d[j+2])-1;promIdx[i]=id;
     if(id<0){d[j+3]=0;continue;}
-    const c=lut[id]||[128,128,128];d[j]=c[0];d[j+1]=c[1];d[j+2]=c[2];d[j+3]=255;}
-  cx.putImageData(px,0,0);
-  const url=URL.createObjectURL(await new Promise(r=>cv.toBlob(r)));
-  promLayer=L.imageOverlay(url,D.prom.bounds,{pane:'prom',opacity:promOpacity,interactive:false});
+    const c=lut[id]||[128,128,128];d[j]=c[0];d[j+1]=c[1];d[j+2]=c[2];d[j+3]=255;
+    const b=promBox[id],x=i%w,y=(i/w)|0;
+    if(x<b[0])b[0]=x;if(y<b[1])b[1]=y;if(x>b[2])b[2]=x;if(y>b[3])b[3]=y;}
+  // an island's box must cover the islands nested in it: grow parents' boxes, deepest first
+  const depth=i=>{let n=0;while(PAR[i]>=0){i=PAR[i];n++;}return n;};
+  [...P.keys()].sort((a,b)=>depth(b)-depth(a)).forEach(i=>{const q=PAR[i];if(q==null||q<0||promBox[i][2]<0)return;
+    const a=promBox[i],b=promBox[q];b[0]=Math.min(b[0],a[0]);b[1]=Math.min(b[1],a[1]);b[2]=Math.max(b[2],a[2]);b[3]=Math.max(b[3],a[3]);});
+  promCtx.putImageData(px,0,0);promBase=px;
+  promLayer=new CanvasOverlay(cv,D.prom.bounds,{pane:'prom',opacity:promOpacity,interactive:false});
 }
 function promAt(ll){
   if(!promIdx) return -1;
-  const [[s,w],[n,e]]=D.prom.bounds,[W,H]=D.prom.size,pr=ll=>L.CRS.EPSG3857.project(ll);
+  const [[s,w],[n,e]]=D.prom.bounds,[W,H]=D.prom.size,pr=x=>L.CRS.EPSG3857.project(x);
   const a=pr(L.latLng(s,w)),b=pr(L.latLng(n,e)),p=pr(ll);
   const x=Math.floor((p.x-a.x)/(b.x-a.x)*W),y=Math.floor((b.y-p.y)/(b.y-a.y)*H);
   return x<0||y<0||x>=W||y>=H?-1:promIdx[y*W+x];
 }
-function promInfo(id){
-  const box=document.getElementById('promInfo');
-  const ramp=`<div class="ramp">${PROM_COLS.map(c=>`<i style="background:${c}"></i>`).join('')}</div>`+
-    `<div class="ticks">${PROM_STOPS.map(v=>`<span>${fmt(v)}+</span>`).join('')}</div>`;
-  let head='Ground above each peak\'s key col, coloured by its prominence (ft). Hover or tap to see whose it is.';
-  if(id>=0){const p=P[id].properties;
-    head=`<b>${esc(p.name||'Unnamed peak')}</b>'s ground · ${fmt(p.prom_ft)} ft prominence`+
-      `${p.front?'':' · not first row'} · <a href="#" onclick="select(${id},true);return false">show</a>`;}
-  box.innerHTML=head+ramp+`<input type="range" min="15" max="100" value="${promOpacity*100}" oninput="promOpacity=this.value/100;promLayer.setOpacity(promOpacity)" aria-label="opacity">`;
+const inIsland=(id,root)=>{while(id>=0){if(id===root)return true;id=PAR[id]??-1;}return false;};
+function outline(root){       // ink the edge of root's whole island; restore the last one
+  if(!promCtx||root===outlined) return;
+  const [W,H]=D.prom.size,cx=promCtx;
+  if(outlineBox){const [x0,y0,x1,y1]=outlineBox;cx.putImageData(promBase,0,0,x0,y0,x1-x0+1,y1-y0+1);}
+  outlined=root;outlineBox=null;
+  if(root<0||promBox[root][2]<0) return;
+  const b=promBox[root],x0=Math.max(0,b[0]-1),y0=Math.max(0,b[1]-1),x1=Math.min(W-1,b[2]+1),y1=Math.min(H-1,b[3]+1);
+  const w=x1-x0+1,h=y1-y0+1,img=cx.getImageData(x0,y0,w,h),d=img.data,memo=new Map();
+  const inside=(x,y)=>{if(x<0||y<0||x>=W||y>=H)return false;const id=promIdx[y*W+x];if(id<0)return false;
+    let v=memo.get(id);if(v===undefined){v=inIsland(id,root);memo.set(id,v);}return v;};
+  const ink=[0,229,255];             // cyan: in neither the palette nor the basemaps
+  for(let y=0;y<h;y++)for(let x=0;x<w;x++){const X=x0+x,Y=y0+y;
+    if(inside(X,Y)&&!(inside(X-1,Y)&&inside(X+1,Y)&&inside(X,Y-1)&&inside(X,Y+1))){const j=(y*w+x)*4;d[j]=ink[0];d[j+1]=ink[1];d[j+2]=ink[2];d[j+3]=255;}}
+  cx.putImageData(img,x0,y0);outlineBox=[x0,y0,x1,y1];
 }
+
+// ---- info box: elevation + whose ground under the pointer, and the colour key
+const tProm=document.getElementById('t_prom'),infoBox=document.getElementById('promInfo');
+infoBox.innerHTML=`<div id="piNow">Hover the map for elevation</div>
+  <div class="pi-tip">Click any point to see why it is or isn't a target.</div>
+  <div id="piKey"><div class="ramp">${PROM_COLS.map(c=>`<i style="background:${c}"></i>`).join('')}</div>
+  <div class="ticks">${PROM_STOPS.map(v=>`<span>${fmt(v)}+</span>`).join('')}</div>
+  <details><summary>Prominence islands: how to read the colours</summary>A peak's island is the ground above its
+  <b>key col</b>, the low point you must drop to before reaching anything higher. Each spot is coloured by the
+  prominence (ft) of the <i>smallest</i> island it sits in. A big mountain owns its lower slopes, while the
+  smaller bumps on top own the summit area, so tops can look paler than the slopes below.
+  Hover anywhere to outline the whole island of the peak that owns it.</details>
+  <input type="range" min="15" max="100" value="${promOpacity*100}" aria-label="island opacity"></div>`;
+infoBox.style.display='block';
+infoBox.querySelector('input').oninput=e=>{promOpacity=e.target.value/100;promLayer?.setOpacity(promOpacity);};
+let hoverId=-1,hoverZ=null,hoverLL=null,zBusy=false;
+function showNow(){
+  const z=hoverZ==null?'':`<b>${fmt(Math.round(hoverZ/0.3048))} ft</b>`;
+  let t;
+  if(hoverId>=0){const p=P[hoverId].properties;t=`${z}${z?' · ':''}<b>${esc(nameOf(p))}</b>'s ground (P${fmt(p.prom_ft)})`;}
+  else t=z?`${z} · below every key col: no peak's ground`:'Hover the map for elevation';
+  document.getElementById('piNow').innerHTML=t;
+}
+async function pumpZ(){zBusy=true;while(hoverLL){const ll=hoverLL;hoverLL=null;hoverZ=await elevAt(ll.lat,ll.lng);showNow();}zBusy=false;}
+map.on('mousemove',e=>{if(typeof drawing!=='undefined'&&drawing) return;
+  const id=promAt(e.latlng);if(id!==hoverId){hoverId=id;if(tProm.checked)outline(id);}
+  hoverLL=e.latlng;if(!zBusy)pumpZ();showNow();});
+map.on('mouseout',()=>{hoverId=-1;outline(-1);});
+const promReady=D.prom?loadProm():Promise.resolve();
 if(D.prom){
-  const t=document.getElementById('t_prom'),box=document.getElementById('promInfo');
-  t.addEventListener('change',async()=>{
-    if(!t.checked){if(promLayer)map.removeLayer(promLayer);box.style.display='none';return;}
-    if(!promLayer){box.style.display='block';box.textContent='Loading prominence…';await loadProm();}
-    if(t.checked){promLayer.addTo(map);box.style.display='block';promInfo(-1);}
-  });
-  let last=-2;
-  const hover=e=>{if(!t.checked||(typeof drawing!=='undefined'&&drawing))return;
-    const id=promAt(e.latlng);if(id!==last){last=id;promInfo(id);}};
-  map.on('mousemove',hover);map.on('click',hover);
-  if(t.checked) t.dispatchEvent(new Event('change'));   // on by default
-}else document.getElementById('t_prom').parentElement.style.display='none';
+  const sync=async()=>{document.getElementById('piKey').style.display=tProm.checked?'':'none';
+    if(!tProm.checked){if(promLayer)map.removeLayer(promLayer);outline(-1);return;}
+    await promReady;if(tProm.checked)promLayer.addTo(map);};
+  tProm.addEventListener('change',sync);sync();
+}else{tProm.parentElement.style.display='none';document.getElementById('piKey').style.display='none';}
+
+// ---- point check: why is (or isn't) this spot a target?
+const geo=(a,b)=>{const r=Math.PI/180,dLa=(b[0]-a[0])*r,dLo=(b[1]-a[1])*r,
+  s=Math.sin(dLa/2)**2+Math.cos(a[0]*r)*Math.cos(b[0]*r)*Math.sin(dLo/2)**2;return 2*6371008.8*Math.asin(Math.sqrt(s));};
+const compass=(a,b)=>{const t=Math.atan2((b[1]-a[1])*Math.cos(a[0]*Math.PI/180),b[0]-a[0])*180/Math.PI;
+  return ['N','NE','E','SE','S','SW','W','NW'][Math.round(((t+360)%360)/45)%8];};
+const ll2=f=>[f.geometry.coordinates[1],f.geometry.coordinates[0]];
+const mi=m=>(m/1609.344).toFixed(1);
+let capIdx=null;
+function capAt(lat,lng){   // which summit cap (top 250 ft of a qualifying peak) contains this point
+  if(!capIdx) capIdx=D.caps.features.map(f=>{const g=f.geometry,polys=g.type==='Polygon'?[g.coordinates]:g.coordinates,
+    xs=polys.flat(2).map(c=>c[0]),ys=polys.flat(2).map(c=>c[1]);
+    return {id:f.properties.id,polys,b:[Math.min(...xs),Math.min(...ys),Math.max(...xs),Math.max(...ys)]};});
+  const ring=(r)=>{let o=false;for(let i=0,j=r.length-1;i<r.length;j=i++){const [xi,yi]=r[i],[xj,yj]=r[j];
+    if((yi>lat)!==(yj>lat)&&lng<(xj-xi)*(lat-yi)/(yj-yi)+xi)o=!o;}return o;};
+  for(const c of capIdx){if(lng<c.b[0]||lng>c.b[2]||lat<c.b[1]||lat>c.b[3])continue;
+    if(c.polys.some(p=>ring(p[0])&&!p.slice(1).some(ring)))return c.id;}
+  return -1;
+}
+// Re-walk a stored I-90 approach with the classifier's rule (adjacency._walk), listing every
+// barrier on the way rather than only the first: other peaks' caps, separate ridges (a rise of
+// >= 250 ft followed by a drop of >= 250 ft), and ground higher than the summit.
+function barriers(d,id){
+  const z=d.z,n=z.length,top=P[id].properties.elev_ft*0.3048,out=[];
+  const road=z.find(v=>v!=null);
+  let lo=Infinity,ridge=-Infinity,ridgeK=0,ridgeRise=0,inCap=-1,inHigh=false;
+  for(let k=0;k<n;k++){const v=z[k];if(v==null)continue;const t=k/(n-1);
+    const cap=capAt(d.h[1]+(d.s[1]-d.h[1])*t,d.h[0]+(d.s[0]-d.h[0])*t);
+    if(cap===id) break;                                   // reached this peak's own cap
+    if(cap>=0){if(cap!==inCap)out.push({t,kind:'cap',who:cap});inCap=cap;continue;}
+    inCap=-1;
+    const high=v>top&&v>road+30;
+    if(high&&!inHigh)out.push({t,kind:'higher',z:v});inHigh=high;
+    if(v<=ridge-TOL_M){out.push({t:ridgeK/(n-1),kind:'ridge',rise:ridgeRise,drop:ridge-v});lo=v;ridge=-Infinity;continue;}
+    if(v<lo)lo=v;else if(v-lo>=TOL_M&&v>ridge){ridge=v;ridgeK=k;ridgeRise=v-lo;}
+  }
+  return out;
+}
+function barrierText(b,len){
+  const at=`${mi(b.t*len)} mi out`;
+  if(b.kind==='cap') return `${at}: crosses the summit cap of <a href="#" onclick="select(${b.who},true);return false">${esc(nameOf(P[b.who].properties))}</a> (P${fmt(P[b.who].properties.prom_ft)})`;
+  if(b.kind==='higher') return `${at}: ground at ${fmt(Math.round(b.z/0.3048))} ft, higher than the summit`;
+  return `${at}: a separate ridge, rising ${fmt(Math.round(b.rise/0.3048))} ft then dropping ${fmt(Math.round(b.drop/0.3048))}+ ft`;
+}
+function tallyText(d){
+  if(!d||!d.tried) return '';
+  const t=d.tally||{},parts=[],listed=(d.caps||[]).reduce((a,[,n])=>a+n,0);
+  if(t.ridge) parts.push(`${t.ridge} cross a separate ridge`);
+  (d.caps||[]).forEach(([id,n])=>parts.push(`${n} hit ${esc(nameOf(P[id].properties))}'s summit cap`));
+  if((t.peak||0)>listed) parts.push(`${t.peak-listed} hit other peaks' caps`);
+  if(t.higher) parts.push(`${t.higher} meet ground higher than the summit`);
+  return `Of ${d.tried} straight lines tried from points along I-90, none reaches its summit cap cleanly: ${parts.join(', ')}.`;
+}
+function chart(z,o){   // elevation profile (metres along a line), with barrier marks
+  const W=320,H=92,px=6,py=14,n=z.length,vals=z.filter(v=>v!=null);if(vals.length<2)return'';
+  const mn=Math.min(...vals),mx=Math.max(...vals),span=Math.max(1,mx-mn);
+  const X=t=>px+(W-2*px)*t,Y=v=>H-py-(H-py-12)*(v-mn)/span,col=o.col||css('--muted');
+  const pts=[];z.forEach((v,i)=>{if(v!=null)pts.push(X(i/(n-1)).toFixed(1)+','+Y(v).toFixed(1));});
+  const ft=v=>fmt(Math.round(v/0.3048));
+  let s=`<svg viewBox="0 0 ${W} ${H}" width="100%" style="display:block;margin-top:4px;overflow:visible">`+
+    `<path d="M${X(0)},${H-py} L${pts.join(' L')} L${X(1)},${H-py} Z" fill="${col}" opacity=".15"/>`+
+    `<polyline points="${pts.join(' ')}" fill="none" stroke="${col}" stroke-width="2"/>`;
+  (o.marks||[]).forEach((m,i)=>{const x=X(m.t);s+=`<line x1="${x}" x2="${x}" y1="8" y2="${H-py}" stroke="#c0392b" stroke-dasharray="3 3"/>`+
+    `<circle cx="${x}" cy="8" r="6.5" fill="#c0392b"/><text x="${x}" y="11" font-size="9" fill="#fff" text-anchor="middle" font-weight="600">${i+1}</text>`;});
+  return s+`<text x="${px}" y="${H-1}" font-size="9.5" fill="${css('--muted')}">${esc(o.from)} · ${ft(vals[0])} ft</text>`+
+    `<text x="${W-px}" y="${H-1}" font-size="9.5" fill="${css('--muted')}" text-anchor="end">${esc(o.to)} · ${ft(vals[vals.length-1])} ft · ${mi(o.len)} mi</text></svg>`;
+}
+async function sampleLine(a,b,n=48){return Promise.all([...Array(n)].map((_,i)=>elevAt(a[0]+(b[0]-a[0])*i/(n-1),a[1]+(b[1]-a[1])*i/(n-1))));}
+let suppressClick=0,demoOpen=false;      // layer clicks set suppressClick so the map click skips them
+const hintSeen=()=>{try{localStorage.setItem('i90_hint_seen','1');}catch(e){}};
+[routeLayer,trackLayer,drawnLayer].forEach(l=>l.on('click',()=>suppressClick=Date.now()));
+map.on('click',e=>{if((typeof drawing!=='undefined'&&drawing)||Date.now()-suppressClick<400)return;inspect(e.latlng);});
+
+async function inspect(ll,demo=false){
+  await promReady;
+  const here=[ll.lat,ll.lng],own=promAt(ll),body=document.getElementById('cardBody');
+  hidePanels();selected=null;pickLayer.clearLayers();demoOpen=demo;render();
+  if(!demo) hintSeen();             // they've found the check themselves
+  L.circleMarker(here,{radius:7,color:'#fff',weight:2.5,fillColor:css('--ink'),fillOpacity:1}).addTo(pickLayer);
+  body.innerHTML=`<div class="eyebrow">${demo?'Example · try it on any point':'Point check'}</div><h2>Checking…</h2>`;
+  document.getElementById('card').style.display='block';
+  const z=await elevAt(...here);
+  let html='',bounds=[here];
+  const p=own>=0?P[own].properties:null,top=own>=0?ll2(P[own]):null,dTop=own>=0?geo(here,top):0;
+  const atTop=own>=0&&dTop<200;
+  html+=`<div class="eyebrow">${demo?'Example · try it on any point':'Point check'}</div>`+
+    `<h2>${atTop?esc(nameOf(p)):`${z==null?'–':fmt(Math.round(z/0.3048))} ft here`}</h2>`;
+  if(demo) html+=`<div class="verdict ok" style="background:var(--chip)">Why isn't ${esc(nameOf(p))} a target, with ${fmt(p.prom_ft)} ft of prominence, only ${p.near_mi} mi from I-90? Here's the data. <b>Click anywhere on the map</b> (tap on a phone) to run the same check on any spot.</div>`;
+
+  // 1. is it a peak?
+  html+=`<div class="step">1 · Is it a peak?</div>`;
+  if(own<0) html+=`<div class="verdict no">No. This ground is below the key col of every 250 ft peak around it, so it belongs to no qualifying peak (valley floor, or a bump with under 250 ft of prominence).</div>`;
+  else if(atTop) html+=`<div class="verdict ok">Yes: the summit of ${esc(nameOf(p))}, ${fmt(p.elev_ft)} ft with ${fmt(p.prom_ft)} ft of prominence (≥ 250 ft).</div>`;
+  else{
+    html+=`<div class="verdict no">Not on its own. It's on <b>${esc(nameOf(p))}</b>'s ground: above its key col (${fmt(p.elev_ft-p.prom_ft)} ft) and below its summit (${fmt(p.elev_ft)} ft, ${mi(dTop)} mi ${compass(here,top)}). There's no 250 ft drop separating this spot from it.</div>`;
+    const zt=await sampleLine(here,top);
+    html+=chart(zt,{from:'here',to:nameOf(p),len:dTop,col:css('--ink')});
+    L.polyline([here,top],{color:css('--ink'),weight:2.5,dashArray:'2 5'}).addTo(pickLayer);bounds.push(top);
+  }
+
+  // 2. is that peak a target?
+  let target=own>=0&&p.front;
+  if(own>=0){
+    const d=DET[own];
+    html+=`<div class="step">2 · Is ${esc(nameOf(p))} a target?</div>`;
+    if(p.front) html+=`<div class="verdict ok"><b>Yes.</b> A straight line from I-90 reaches its top-250 ft cap with nothing qualifying in between.</div>`;
+    else if(d&&d.kind==='far_lowland') html+=`<div class="verdict no"><b>No.</b> Nothing ≥ 250 ft stands between it and I-90, but it's a lowland hill (under 1,500 ft) ${p.near_mi} mi out; lowland hills only count within 4 mi.</div>`;
+    else html+=`<div class="verdict no"><b>No: it's behind the first row.</b> ${tallyText(d)}</div>`;
+    if(d){
+      const h=[d.h[1],d.h[0]],s=[d.s[1],d.s[0]],bs=p.front?[]:barriers(d,own);
+      html+=chart(d.z,{from:'I-90',to:nameOf(p),len:d.len,marks:bs,col:p.front?css('--front'):css('--behind')});
+      if(bs.length) html+=`<ol class="marks">${bs.map(b=>`<li>${barrierText(b,d.len)}</li>`).join('')}</ol>`+
+        `<div class="marks">The nearest approach (from ${mi(geo(h,s))} mi away) is shown; the rule needs just one clean line.</div>`;
+      L.polyline([h,s],{color:p.front?css('--front'):'#c0392b',weight:3}).addTo(pickLayer);
+      L.circleMarker(h,{radius:6,color:'#fff',weight:2,fillColor:css('--hw'),fillOpacity:1}).addTo(pickLayer);
+      bs.forEach((b,i)=>L.marker([h[0]+(s[0]-h[0])*b.t,h[1]+(s[1]-h[1])*b.t],{icon:L.divIcon({className:'bmark',html:String(i+1),iconSize:[18,18]})}).addTo(pickLayer));
+      bounds.push(h,s);
+    }
+  }
+
+  // 3. the nearest target, and the ground between
+  if(!target){
+    let best=-1,bd=Infinity;P.forEach((f,i)=>{if(!f.properties.front)return;const dd=geo(here,ll2(f));if(dd<bd){bd=dd;best=i;}});
+    if(best>=0){const q=P[best].properties,t=ll2(P[best]);
+      html+=`<div class="step">3 · Nearest target</div><div class="verdict ok"><a href="#" onclick="select(${best},true);return false"><b>${esc(nameOf(q))}</b></a>, ${mi(bd)} mi ${compass(here,t)} (${fmt(q.elev_ft)} ft, P${fmt(q.prom_ft)}).</div>`;
+      html+=chart(await sampleLine(here,t),{from:'here',to:nameOf(q),len:bd,col:css('--front')});
+      L.polyline([here,t],{color:css('--front'),weight:2.5,dashArray:'7 6'}).addTo(pickLayer);bounds.push(t);}
+  }
+  body.innerHTML=html;
+  if(demo) map.flyToBounds(L.latLngBounds(bounds).pad(.25),{duration:.8});
+}
+// Moolock Mountain: a 931 ft-prominence peak 6.6 mi from I-90 that still isn't first row,
+// flagged on the map and walked through automatically on a first visit
+const DEMO=P.findIndex(f=>f.properties.name==='Moolock Mountain');
+if(DEMO>=0){
+  const at=L.latLng(...ll2(P[DEMO]));
+  L.marker(at,{icon:L.divIcon({className:'hintflag',html:'<span>Why isn\'t this a target?</span>',iconSize:null,iconAnchor:[0,33]}),zIndexOffset:1000})
+    .on('click',()=>{suppressClick=Date.now();inspect(at,true);}).addTo(map);
+  let seen=false;try{seen=localStorage.getItem('i90_hint_seen')==='1';}catch(e){}
+  if(!seen) promReady.then(()=>setTimeout(()=>inspect(at,true),400));
+}
 
 // ---- detail card
 function profileSVG(d){
@@ -476,10 +670,11 @@ function select(id,fly){
   } else if(fly) map.flyTo([c[1],c[0]],13);
   let why;
   if(p.front) why=`<div class="verdict ok"><b>First row.</b> A straight line from I-90 reaches this peak's top-250 ft cap without crossing another qualifying peak or any ground higher than the summit.</div>`;
-  else if(d&&d.kind==='peak'&&d.by>=0) why=`<div class="verdict no"><b>Behind.</b> Every approach from I-90 first crosses the cap of <a onclick="select(${d.by},true)">${nameOf(P[d.by].properties)}</a> (P${fmt(P[d.by].properties.prom_ft)}).</div>`;
+  else if(d&&d.kind==='peak'&&d.by>=0) why=`<div class="verdict no"><b>Behind.</b> The nearest approach from I-90 first crosses the cap of <a onclick="select(${d.by},true)">${nameOf(P[d.by].properties)}</a> (P${fmt(P[d.by].properties.prom_ft)}). ${tallyText(d)}</div>`;
   else if(d&&d.kind==='far_lowland') why=`<div class="verdict no"><b>Not counted.</b> Nothing ≥250 ft stands between it and I-90, but it is a lowland hill (under 1,500 ft) ${p.near_mi} mi from the freeway. Lowland hills only count within 4 mi.</div>`;
-  else if(d&&d.kind==='ridge') why=`<div class="verdict no"><b>Behind.</b> Every approach from I-90 crosses ridge ground higher than this summit.</div>`;
-  else why=`<div class="verdict no"><b>Behind.</b> No clean approach from I-90.</div>`;
+  else if(d&&d.kind==='ridge') why=`<div class="verdict no"><b>Behind.</b> The nearest approach from I-90 crosses a separate ridge: ground that rises at least 250 ft and then drops at least 250 ft before this peak. ${tallyText(d)}</div>`;
+  else if(d&&d.kind==='higher') why=`<div class="verdict no"><b>Behind.</b> The nearest approach from I-90 crosses ground higher than this summit. ${tallyText(d)}</div>`;
+  else why=`<div class="verdict no"><b>Behind.</b> No clean approach from I-90. ${tallyText(d)}</div>`;
   if(p.access) why+=`<div class="verdict no">⚠ On the ${esc(p.access)}.</div>`;
   if(p.done) why+=`<div class="verdict ok" style="background:color-mix(in srgb,var(--done) 18%,transparent)"><b>✓ Summited</b>${p.done_by.length?' on '+p.done_by.slice(0,4).map(esc).join(', '):''}</div>`;
   if(STATE?.owner&&p.front){
@@ -496,7 +691,8 @@ function select(id,fly){
   document.getElementById('card').style.display='block';
   render();
 }
-function closeCard(){document.getElementById('card').style.display='none';pickLayer.clearLayers();selected=null;render();}
+function closeCard(){document.getElementById('card').style.display='none';pickLayer.clearLayers();selected=null;
+  if(demoOpen){hintSeen();demoOpen=false;}render();}
 
 // ---- theme toggle
 document.getElementById('themeBtn').onclick=()=>{
