@@ -64,7 +64,11 @@ section{padding:44px 0;border-top:1px solid var(--line)}
 .card:hover,.card.sel{border-color:var(--accent)}
 .card .meta{font-size:12px;color:var(--muted)}
 .card .stats{display:flex;gap:14px;font-size:12px;color:var(--ink2);margin:8px 0;font-variant-numeric:tabular-nums}
-.barcode{display:flex;height:22px;border-radius:6px;overflow:hidden;margin:10px 0 6px}
+.barcode{display:flex;height:22px;border-radius:6px;overflow:hidden;margin:3px 0 0}
+.blabel{display:flex;gap:8px;align-items:baseline;font-size:10.5px;color:var(--muted);margin-top:10px;letter-spacing:.02em}
+.blabel b{color:var(--ink2);font-weight:600;text-transform:uppercase;letter-spacing:.08em;font-size:9.5px}
+.blabel span:last-child{margin-left:auto}
+.stack{margin-top:3px}
 .barcode i{flex:1}
 .stack{display:flex;height:10px;border-radius:5px;overflow:hidden;gap:2px;background:var(--panel)}
 .stack i{display:block;height:100%}
@@ -112,11 +116,17 @@ footer{padding:36px 0 60px;color:var(--muted);font-size:12.5px;border-top:1px so
 
 <section id="routes">
   <h2>My completed peak routes</h2>
-  <p class="sub">Each run that topped out on a first-row peak. The colour strip is the route
-    "painted in the AI's own colours": its top three embedding directions shown as red, green and
-    blue, start to finish. The bar under it is the route's terrain mix (unsupervised classes from the
-    embeddings). Click a card to rank every other run against it.</p>
-  <div class="legend" id="legend"></div>
+  <p class="sub">Each run that topped out on a first-row peak, with two bars:</p>
+  <ul class="sub" style="margin:4px 0 10px;padding-left:18px">
+    <li><b>Landscape fingerprint</b>: the route from start (left) to finish (right), each slice
+      coloured by Google's AlphaEarth satellite embedding at that point. Similar colours mean
+      similar-looking ground; the colours themselves are arbitrary (the embedding's three strongest
+      patterns shown as red, green and blue), so read changes, not hues.</li>
+    <li><b>Terrain mix</b>: the share of the route in each terrain type below (grouped from the same
+      embeddings), in order of the key.</li>
+  </ul>
+  <p class="sub" style="margin-top:0">Click a card to rank every other run against it.</p>
+  <div class="legend" id="legend"><b style="margin-right:4px">Terrain mix key</b></div>
   <div class="cards" id="cards"></div>
 </section>
 
@@ -216,11 +226,13 @@ const s=D.stats;
 $('#tiles').innerHTML=[[s.front,'first-row peaks'],[s.done,'summited'],[N,'routes compared'],[s.n_planned,'planned outings']]
   .map(([v,l])=>`<div class="tile"><b>${v}</b><span>${l}</span></div>`).join('');
 // ---- legend + cards
-$('#legend').innerHTML=D.groups.map(g=>`<span><i style="background:${gcol(g)}"></i>${g.label}</span>`).join('');
+$('#legend').innerHTML='<b style="margin-right:4px">Terrain mix:</b>'+D.groups.map(g=>`<span><i style="background:${gcol(g)}"></i>${g.label}</span>`).join('');
 const stack=c=>`<div class="stack" role="img" aria-label="terrain mix">${c.map((v,k)=>v>0.004?`<i title="${D.groups[k].label}: ${Math.round(v*100)}%" style="width:${v*100}%;background:${gcol(D.groups[k])}"></i>`:'').join('')}</div>`;
 $('#cards').innerHTML=R.map(r=>`<div class="card${sel===r.id?' sel':''}" data-id="${r.id}">
   <div class="meta">${esc(r.date)} · ${esc(r.type)}</div><h3>${esc(r.name)}</h3>
-  <div class="barcode" title="route painted in AlphaEarth colours, start → finish">${r.barcode.map(c=>`<i style="background:${c}"></i>`).join('')}</div>
+  <div class="blabel"><b>Landscape fingerprint</b><span>start → finish</span></div>
+  <div class="barcode" title="each slice: AlphaEarth colour of the ground at that point, start → finish">${r.barcode.map(c=>`<i style="background:${c}"></i>`).join('')}</div>
+  <div class="blabel"><b>Terrain mix</b><span>% of route</span></div>
   ${stack(r.comp)}
   <div class="stats"><span>${r.dist_mi} mi</span><span>${fmt(r.gain_ft)} ft gain</span>${r.moving_h?`<span>${r.moving_h} h moving</span>`:''}<span>${r.off_trail_pct}% off-trail</span></div>
   <div class="chips">${r.peaks.map(p=>`<span class="chip">▲ ${esc(p)}</span>`).join('')}</div></div>`).join('');
