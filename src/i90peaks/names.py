@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import geopandas as gpd
 import numpy as np
-import osmnx as ox
 from scipy.spatial import cKDTree
 
 from . import config
@@ -14,26 +13,26 @@ _CACHE = config.INTERIM / "osm_peaks.gpkg"
 def _osm_peaks(bbox=config.BBOX) -> gpd.GeoDataFrame:
     if _CACHE.exists():
         return gpd.read_file(_CACHE)
+    from .highway import overpass
     w, s, e, n = bbox
-    feats = ox.features_from_bbox(bbox=(w, s, e, n), tags={"natural": "peak"})
-    feats = feats[feats.geometry.type == "Point"]
-    cols = [c for c in ["name", "ele", "geometry"] if c in feats.columns]
-    out = feats[cols].copy()
-    if "name" not in out.columns:
-        out["name"] = None
-    out = out[out["name"].notna()].reset_index(drop=True)
+    elems = overpass(f'node["natural"~"^(peak|hill)$"]["name"]({s},{w},{n},{e});out;')
+    out = gpd.GeoDataFrame(
+        {"name": [el["tags"]["name"] for el in elems],
+         "ele": [el["tags"].get("ele") for el in elems]},
+        geometry=gpd.points_from_xy([el["lon"] for el in elems], [el["lat"] for el in elems]),
+        crs="EPSG:4326")
     out.to_file(_CACHE, driver="GPKG")
     return out
 
 
-def attach_names(peaks: gpd.GeoDataFrame, match_radius_m: float = 200.0) -> gpd.GeoDataFrame:
+def attach_names(peaks: gpd.GeoDataFrame, match_radius_m: float = 350.0) -> gpd.GeoDataFrame:
     """Add a `name` column from the nearest OSM peak within match_radius_m."""
     osm = _osm_peaks()
     peaks = peaks.copy()
     if osm.empty:
         peaks["name"] = ""
         return peaks
-    pm = peaks.to_crs(3857); om = osm.to_crs(3857)
+    pm = peaks.to_crs(32610); om = osm.to_crs(32610)   # true metres (UTM 10N)
     otree = cKDTree(np.column_stack([om.geometry.x, om.geometry.y]))
     dist, idx = otree.query(np.column_stack([pm.geometry.x, pm.geometry.y]), k=1)
     names = om["name"].to_numpy()[idx]

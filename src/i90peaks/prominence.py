@@ -23,6 +23,7 @@ import numpy as np
 import pandas as pd
 import rasterio
 from pyproj import Transformer
+from numba import njit
 from shapely.geometry import Point
 
 from . import config
@@ -30,16 +31,73 @@ from . import config
 M_PER_FT = 0.3048
 
 
-def _find(parent: np.ndarray, i: int) -> int:
+@njit(cache=True)
+def _find(parent, i):
     while parent[i] != i:
         parent[i] = parent[parent[i]]
         i = parent[i]
     return i
 
 
+@njit(cache=True)
+def _sweep(elev_flat, valid_flat, order, ncols, eight):
+    """Descending union-find over the activation order (numba-compiled)."""
+    N = elev_flat.size
+    parent = np.arange(N).astype(np.int64)
+    activated = np.zeros(N, dtype=np.bool_)
+    comp_peak = np.zeros(N, dtype=np.int64)        # root -> summit cell
+    comp_pelev = np.full(N, -np.inf, np.float32)   # root -> summit elevation
+    is_peak = np.zeros(N, dtype=np.bool_)
+    prom = np.full(N, np.nan, dtype=np.float64)    # indexed by summit cell
+    saddle_cell = np.full(N, -1, dtype=np.int64)
+    dr = np.array([-1, 1, 0, 0, -1, -1, 1, 1])
+    dc = np.array([0, 0, -1, 1, -1, 1, -1, 1])
+    nn = 8 if eight else 4
+    roots = np.empty(8, dtype=np.int64)
+    for k in range(order.size):
+        idx = order[k]
+        e = elev_flat[idx]
+        r, c = idx // ncols, idx % ncols
+        activated[idx] = True
+        nr = 0
+        for j in range(nn):
+            rr, cc = r + dr[j], c + dc[j]
+            if rr < 0 or cc < 0 or cc >= ncols or rr * ncols + cc >= N:
+                continue
+            nb = rr * ncols + cc
+            if valid_flat[nb] and activated[nb]:
+                rt = _find(parent, nb)
+                dup = False
+                for q in range(nr):
+                    if roots[q] == rt:
+                        dup = True
+                if not dup:
+                    roots[nr] = rt
+                    nr += 1
+        if nr == 0:                       # brand new local maximum -> a peak
+            comp_peak[idx] = idx
+            comp_pelev[idx] = e
+            is_peak[idx] = True
+            continue
+        winner = roots[0]                 # join the highest-summit neighbour
+        for q in range(1, nr):
+            if comp_pelev[roots[q]] > comp_pelev[winner]:
+                winner = roots[q]
+        parent[idx] = winner
+        for q in range(nr):
+            rt = roots[q]
+            if rt == winner:
+                continue
+            pk = comp_peak[rt]
+            prom[pk] = comp_pelev[rt] - e     # dies at this saddle
+            saddle_cell[pk] = idx
+            parent[rt] = winner
+    return is_peak, prom, saddle_cell, comp_pelev
+
+
 def compute_peaks(dem_path=config.DEM_TIF, prom_min_m=config.PROM_MIN_M,
                   connectivity: int = 8, overwrite: bool = False) -> gpd.GeoDataFrame:
-    out = config.INTERIM / "peaks_computed.gpkg"
+    out = config.INTERIM / f"peaks_computed_p{prom_min_m / M_PER_FT:.0f}.gpkg"
     if out.exists() and not overwrite:
         print(f"[prominence] cached: {out}")
         return gpd.read_file(out)
@@ -63,54 +121,9 @@ def compute_peaks(dem_path=config.DEM_TIF, prom_min_m=config.PROM_MIN_M,
     order = np.argsort(sort_key, kind="stable")[::-1]
     n_valid = int(valid_flat.sum())
     order = order[:n_valid]
-    cols_of = (order % ncols).astype(np.int32)
 
-    parent = np.arange(N, dtype=np.int32)
-    activated = np.zeros(N, dtype=bool)
-    comp_peak = np.zeros(N, dtype=np.int64)     # root -> summit cell
-    comp_pelev = np.full(N, -np.inf, np.float32)  # root -> summit elevation
-    is_peak = np.zeros(N, dtype=bool)
-    prom = np.full(N, np.nan, dtype=np.float64)  # indexed by summit cell
-    saddle_cell = np.full(N, -1, dtype=np.int64)
-
-    nbr = (-ncols, ncols, -1, 1) if connectivity == 4 else (
-        -ncols, ncols, -1, 1, -ncols - 1, -ncols + 1, ncols - 1, ncols + 1)
-
-    for k in range(n_valid):
-        idx = int(order[k]); e = float(elev_flat[idx]); c = cols_of[k]
-        activated[idx] = True
-        roots = set()
-        for off in nbr:
-            nb = idx + off
-            if nb < 0 or nb >= N:
-                continue
-            if off == -1 and c == 0:        continue
-            if off == 1 and c == ncols - 1: continue
-            if off in (-ncols - 1, ncols - 1) and c == 0:        continue
-            if off in (-ncols + 1, ncols + 1) and c == ncols - 1: continue
-            if valid_flat[nb] and activated[nb]:
-                roots.add(_find(parent, nb))
-
-        if not roots:
-            # brand new local maximum -> a peak
-            parent[idx] = idx
-            comp_peak[idx] = idx
-            comp_pelev[idx] = e
-            is_peak[idx] = True
-            continue
-
-        # join the highest-summit neighbouring component
-        winner = max(roots, key=lambda rt: comp_pelev[rt])
-        parent[idx] = winner
-        for rt in roots:
-            if rt == winner:
-                continue
-            pk = int(comp_peak[rt])
-            prom[pk] = float(comp_pelev[rt]) - e      # dies at this saddle
-            saddle_cell[pk] = idx
-            parent[rt] = winner
-        # winner keeps its (higher) summit; ensure idx points to winner's data
-        # (comp_peak/comp_pelev are read via root, which stays `winner`)
+    is_peak, prom, saddle_cell, comp_pelev = _sweep(
+        elev_flat, valid_flat, order.astype(np.int64), ncols, connectivity == 8)
 
     # Regional survivors: peaks that never died -> measure to frame floor.
     peak_cells = np.flatnonzero(is_peak)

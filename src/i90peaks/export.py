@@ -18,7 +18,7 @@ def _wpt_name(p) -> str:
     name = p.get("name") if hasattr(p, "get") else None
     if name and str(name) not in ("", "nan", "None"):
         return str(name)
-    return f"{p.elev_ft:.0f}ft pk (P{p.prom_ft:.0f})"
+    return f"Pt {p.elev_ft:.0f}"
 
 
 def to_gpx(classified, out_path=None, frontrow_only: bool = True) -> str:
@@ -34,8 +34,7 @@ def to_gpx(classified, out_path=None, frontrow_only: bool = True) -> str:
         ele_m = p.elev_ft * M_PER_FT
         name = escape(_wpt_name(p))
         cmt = escape(f"elev {p.elev_ft:.0f} ft, prominence {p.prom_ft:.0f} ft"
-                     + ("" if p.get("frontrow", True) else
-                        f", occluded (+{p.get('barrier_above_m', 0):.0f} m barrier)"))
+                     + ("" if p.get("frontrow", True) else ", behind the first row"))
         parts.append(
             f'  <wpt lat="{p.lat:.6f}" lon="{p.lon:.6f}">\n'
             f'    <ele>{ele_m:.1f}</ele>\n'
@@ -54,7 +53,7 @@ def to_gpx(classified, out_path=None, frontrow_only: bool = True) -> str:
 def to_geojson(classified, out_path=None) -> str:
     out_path = out_path or (config.PROCESSED / "i90_peaks.geojson")
     keep = [c for c in ["lat", "lon", "elev_ft", "prom_ft", "frontrow",
-                        "barrier_above_m", "name", "geometry"] if c in classified.columns]
+                        "block_kind", "nearest_i90_m", "name", "geometry"] if c in classified.columns]
     classified[keep].to_file(out_path, driver="GeoJSON")
     print(f"[export] GeoJSON -> {out_path}")
     return str(out_path)

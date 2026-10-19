@@ -27,12 +27,13 @@ def make_map(classified, highway, out_path=config.RESULT_MAP):
 
     fg_occ = folium.FeatureGroup(name=f"Occluded ({len(occ)})", show=False).add_to(m)
     for _, p in occ.iterrows():
-        barrier = p.get("barrier_above_m", float("nan"))
+        why = {"peak": "another peak's cap in the way", "ridge": "intervening ridge",
+               "higher": "higher ground in the way"}.get(p.get("block_kind"), "no clean approach")
         folium.CircleMarker(
             [p.lat, p.lon], radius=3, color="#999999", fill=True, fill_opacity=0.6,
             popup=folium.Popup(
                 f"occluded<br>elev {p.elev_ft:.0f} ft<br>prom {p.prom_ft:.0f} ft<br>"
-                f"barrier +{barrier:.0f} m above summit", max_width=220),
+                f"{why}", max_width=220),
         ).add_to(fg_occ)
 
     folium.LayerControl(collapsed=False).add_to(m)

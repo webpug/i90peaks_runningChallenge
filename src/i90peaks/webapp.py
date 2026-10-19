@@ -1,217 +1,1062 @@
-"""Generate a standalone interactive web app (single self-contained HTML).
+"""Generate the standalone interactive web app (one self-contained HTML file).
 
-Beyond the map of first-row vs occluded peaks, the app *explains the computation*:
-click any peak to draw the straight approach line from the nearest I-90 point to its
-summit and a live elevation cross-section, with the blocking ridge (if any) marked --
-so it's visible why each peak is first row or behind a ridge.
+The app maps every >= 250 ft-prominence peak along I-90 (Seattle -> Columbia
+River), highlights the *first-row* peaks, draws each peak's summit cap (the top
+250 ft of its massif), and explains every verdict: select a peak to see the
+straight approach from I-90 and its terrain profile, with the cap entry or the
+blocking peak/ridge marked.
+
+Optional layers (completed summits, GPS tracks, planned routes) are injected as
+GeoJSON so later phases can reuse the same page. Served from theblacks.ai, the page
+then loads the live state (runs uploaded as CalTopo GeoJSON, summits, drawn routes)
+from /i90peaks/api/state and lets the owner upload runs and save routes drawn with
+the built-in route tool (elevation from AWS terrain tiles, time from the pace model).
 """
 from __future__ import annotations
 
 import json
 
-from . import config
+from . import config, promraster
 
-M_PER_FT = 0.3048
+
+def _clean_name(v) -> str:
+    return "" if v is None or str(v) in ("", "nan", "None") else str(v)
 
 
 def _peaks_geojson(classified) -> dict:
     feats = []
     for i, (_, p) in enumerate(classified.iterrows()):
-        cls = "front" if bool(p.get("frontrow", False)) else "behind"
         feats.append({
             "type": "Feature",
-            "geometry": {"type": "Point", "coordinates": [round(p.lon, 6), round(p.lat, 6)]},
+            "geometry": {"type": "Point", "coordinates": [round(p.lon, 5), round(p.lat, 5)]},
             "properties": {
                 "id": i,
+                "name": _clean_name(p.get("name")),
                 "elev_ft": round(float(p.elev_ft)),
-                "prom_ft": round(float(p.prom_ft)),
-                "cls": cls,
-                "name": (str(p.get("name")) if p.get("name") not in (None, "", "nan") else ""),
+                # report the reference prominence for near-threshold peaks we rescued
+                "prom_ft": round(max(float(p.prom_ft), float(p.get("prom_kirmse_ft") or 0)))
+                if float(p.prom_ft) < config.PROM_MIN_FT else round(float(p.prom_ft)),
+                "front": bool(p.frontrow),
+                "near_mi": round(float(p.get("nearest_i90_m", 0)) / 1609.344, 1),
+                "done": bool(p.get("done", False)),
+                "done_by": p.get("done_by", []) if isinstance(p.get("done_by"), list) else [],
+                "access": p.get("access_note") or "",
             },
         })
     return {"type": "FeatureCollection", "features": feats}
 
 
-def build_app(classified, highway, details=None, out_path=None) -> str:
-    out_path = out_path or (config.PROCESSED / "i90_app.html")
-    peaks_gj = _peaks_geojson(classified)
-    hw_gj = json.loads(highway.to_crs(4326).to_json())
-    center = [float(classified.lat.mean()), float(classified.lon.mean())]
-    max_prom = int(classified.prom_ft.max())
+def _caps_geojson(caps, classified) -> dict:
+    if caps is None:
+        return {"type": "FeatureCollection", "features": []}
+    front = set(classified.index[classified.frontrow].tolist())
+    feats = []
+    for idx, row in caps.iterrows():
+        g = row.geometry.__geo_interface__
+        feats.append({"type": "Feature", "geometry": _round_geom(g),
+                      "properties": {"id": int(idx), "front": int(idx) in front}})
+    return {"type": "FeatureCollection", "features": feats}
 
-    html = _TEMPLATE
-    html = html.replace("__PEAKS__", json.dumps(peaks_gj))
-    html = html.replace("__HIGHWAY__", json.dumps(hw_gj))
-    html = html.replace("__DETAILS__", json.dumps(details or []))
-    html = html.replace("__CENTER__", json.dumps(center))
-    html = html.replace("__MAXPROM__", str(max_prom))
+
+def _round_geom(g, nd=5):
+    def r(c):
+        return [round(c[0], nd), round(c[1], nd)] if isinstance(c[0], (int, float)) else [r(x) for x in c]
+    return {"type": g["type"], "coordinates": r(g["coordinates"])}
+
+
+def build_app(classified, highway, details=None, caps=None, tracks=None, routes=None,
+              out_path=None, links=None, pace=None) -> str:
+    out_path = out_path or (config.PROCESSED / "i90_app.html")
+    data = {
+        "peaks": _peaks_geojson(classified),
+        "highway": json.loads(highway.to_crs(4326).simplify(0.0002).to_json()),
+        "details": details or [],
+        "caps": _caps_geojson(caps, classified),
+        "tracks": tracks or {"type": "FeatureCollection", "features": []},
+        "routes": routes or {"type": "FeatureCollection", "features": []},
+        "links": links or [],
+        "pace": pace,
+        "prom": promraster.load_meta(),     # prominence-island raster, if built
+    }
+    html = (_TEMPLATE.replace("__LIVE_JS__", _LIVE_JS)
+            .replace("__DATA__", json.dumps(data, separators=(",", ":"))))
     with open(out_path, "w") as fh:
         fh.write(html)
-    print(f"[webapp] wrote {out_path}")
+    print(f"[webapp] wrote {out_path} ({len(html) / 1e6:.1f} MB)")
     return str(out_path)
 
 
 _TEMPLATE = r"""<!DOCTYPE html>
-<html><head><meta charset="utf-8"><title>I-90 First-Row Peaks</title>
+<html lang="en"><head><meta charset="utf-8">
+<title>I-90 Peaks</title>
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="description" content="Every peak with 250 ft of prominence directly adjacent to I-90, Seattle to the Columbia River.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,500;9..144,700&family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 <style>
-  html,body,#map{height:100%;margin:0}
-  #panel{position:absolute;top:10px;right:10px;z-index:1000;background:#fff;
-    padding:12px 14px;border-radius:10px;box-shadow:0 1px 6px rgba(0,0,0,.3);
-    font:13px/1.4 system-ui,sans-serif;max-width:290px}
-  #panel h3{margin:0 0 6px;font-size:14px}
-  .row{margin:7px 0}
-  button{cursor:pointer;border:0;border-radius:6px;padding:6px 9px;font-size:12px;
-    background:#2c7fb8;color:#fff;margin-right:5px}
-  button.alt{background:#555}
-  input[type=range]{width:100%}
-  .sw{display:inline-block;width:11px;height:11px;border-radius:50%;
-    margin-right:4px;vertical-align:middle}
-  .muted{color:#666;font-size:11px}
-  #chart{margin-top:6px}
-  #chart .ttl{font-size:12px;font-weight:600;margin-bottom:2px}
+:root{
+  --bg:#f4f1ea; --panel:#fbfaf6; --ink:#1c2422; --muted:#6b736f; --line:#e2ddd2;
+  --front:#d4572a; --front-soft:rgba(212,87,42,.16); --behind:#8d9792; --hw:#2d5b86;
+  --done:#2f8a5b; --track:#7a3fb0; --route:#0f7c86; --drawn:#c2185b; --chip:#ece7dc; --shadow:0 10px 30px rgba(28,36,34,.12);
+}
+@media (prefers-color-scheme: dark){:root:not([data-theme="light"]){
+  --bg:#121615; --panel:#1a201e; --ink:#e9ece8; --muted:#9aa49f; --line:#2b3330;
+  --front:#ff7a45; --front-soft:rgba(255,122,69,.2); --behind:#6d7772; --hw:#78a9d8;
+  --done:#4cc489; --track:#b98cf0; --route:#4fc6cf; --drawn:#f06292; --chip:#242c29; --shadow:0 10px 30px rgba(0,0,0,.45);}}
+:root[data-theme="dark"]{
+  --bg:#121615; --panel:#1a201e; --ink:#e9ece8; --muted:#9aa49f; --line:#2b3330;
+  --front:#ff7a45; --front-soft:rgba(255,122,69,.2); --behind:#6d7772; --hw:#78a9d8;
+  --done:#4cc489; --track:#b98cf0; --route:#4fc6cf; --drawn:#f06292; --chip:#242c29; --shadow:0 10px 30px rgba(0,0,0,.45);}
+*{box-sizing:border-box}
+html,body{height:100%;margin:0;background:var(--bg);color:var(--ink);
+  font:14px/1.45 Inter,system-ui,sans-serif;-webkit-font-smoothing:antialiased}
+.app{display:grid;grid-template-columns:380px 1fr;height:100%}
+#map{height:100%;background:var(--bg)}
+aside{background:var(--panel);border-right:1px solid var(--line);display:flex;flex-direction:column;min-height:0;z-index:2}
+header{padding:20px 22px 14px;border-bottom:1px solid var(--line)}
+.eyebrow{font-size:11px;letter-spacing:.14em;text-transform:uppercase;color:var(--muted);font-weight:600}
+h1{font-family:Fraunces,Georgia,serif;font-weight:700;font-size:28px;line-height:1.1;margin:4px 0 6px}
+.sub{color:var(--muted);font-size:13px}
+.stats{display:flex;gap:10px;margin-top:14px}
+.stat{flex:1;background:var(--chip);border-radius:12px;padding:9px 11px}
+.stat b{display:block;font-family:Fraunces,serif;font-size:22px;line-height:1.1}
+.stat span{font-size:11px;color:var(--muted)}
+.bar{height:6px;border-radius:3px;background:var(--chip);margin-top:12px;overflow:hidden}
+.bar i{display:block;height:100%;background:var(--done);width:0;transition:width .6s}
+.nav{display:flex;gap:6px;margin-top:12px;flex-wrap:wrap}
+.nav a{font-size:12px;font-weight:600;color:var(--ink);text-decoration:none;background:var(--chip);
+  padding:6px 10px;border-radius:999px}
+.nav a:hover,.nav button:hover{background:var(--front-soft)}
+.nav button{font:600 12px Inter,sans-serif;color:var(--ink);background:var(--chip);border:0;
+  padding:6px 10px;border-radius:999px;cursor:pointer}
+.nav button.on{background:var(--ink);color:var(--panel)}
+.controls{padding:12px 22px;border-bottom:1px solid var(--line);display:grid;gap:10px}
+.seg{display:flex;background:var(--chip);border-radius:10px;padding:3px}
+.seg button{flex:1;border:0;background:transparent;color:var(--muted);font:600 12px Inter,sans-serif;
+  padding:7px 4px;border-radius:8px;cursor:pointer}
+.seg button.on{background:var(--panel);color:var(--ink);box-shadow:0 1px 3px rgba(0,0,0,.12)}
+input[type=search]{width:100%;border:1px solid var(--line);background:var(--panel);color:var(--ink);
+  border-radius:10px;padding:8px 11px;font:inherit}
+.range{display:flex;align-items:center;gap:10px;font-size:12px;color:var(--muted)}
+.range input{flex:1;accent-color:var(--front)}
+.toggles{display:flex;gap:14px;font-size:12px;color:var(--muted);flex-wrap:wrap}
+.toggles label{display:flex;align-items:center;gap:5px;cursor:pointer}
+.toggles input{accent-color:var(--front)}
+#list{overflow:auto;flex:1;min-height:0}
+.pk{display:grid;grid-template-columns:14px 1fr auto;gap:10px;align-items:center;padding:9px 22px;
+  border-bottom:1px solid var(--line);cursor:pointer}
+.pk:hover,.pk.sel{background:var(--front-soft)}
+.dot{width:10px;height:10px;border-radius:50%}
+.pk .nm{font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.pk .meta{font-size:11.5px;color:var(--muted)}
+.pk .el{font-variant-numeric:tabular-nums;font-size:12px;color:var(--muted);text-align:right}
+.foot{padding:10px 22px;border-top:1px solid var(--line);display:flex;gap:8px;align-items:center}
+.btn{border:1px solid var(--line);background:var(--panel);color:var(--ink);border-radius:9px;
+  padding:7px 11px;font:600 12px Inter,sans-serif;cursor:pointer}
+.btn:hover{border-color:var(--front)}
+.foot .sp{flex:1}
+#card{position:absolute;right:16px;top:16px;width:360px;max-width:calc(100% - 32px);background:var(--panel);
+  border-radius:16px;box-shadow:var(--shadow);padding:16px 18px;z-index:500;display:none;max-height:calc(100% - 32px);overflow:auto;box-sizing:border-box;border:1px solid var(--line)}
+#card h2{font-family:Fraunces,serif;font-size:22px;margin:0 28px 2px 0;line-height:1.15}
+#card .x{position:absolute;right:12px;top:10px;border:0;background:none;color:var(--muted);font-size:20px;cursor:pointer}
+.kv{display:flex;gap:16px;margin:8px 0 10px}
+.kv div{font-size:11px;color:var(--muted)} .kv b{display:block;font-size:16px;color:var(--ink);font-variant-numeric:tabular-nums}
+.verdict{font-size:12.5px;padding:8px 10px;border-radius:10px;margin-top:8px}
+.verdict.ok{background:var(--front-soft)} .verdict.no{background:var(--chip)}
+.verdict a{color:var(--front);font-weight:600;cursor:pointer}
+.legend{display:flex;gap:10px;font-size:11px;color:var(--muted);margin-top:6px;flex-wrap:wrap}
+.legend i{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:4px;vertical-align:middle}
+.leaflet-container{font:inherit;background:var(--bg)}
+.leaflet-popup-content-wrapper,.leaflet-popup-tip{background:var(--panel);color:var(--ink)}
+.leaflet-tooltip{background:var(--panel);color:var(--ink);border:1px solid var(--line);box-shadow:var(--shadow)}
+.theme{position:absolute;left:12px;bottom:24px;z-index:500}
+.panel{position:absolute;right:16px;top:16px;width:380px;max-width:calc(100% - 32px);max-height:calc(100% - 32px);
+  overflow:auto;background:var(--panel);border-radius:16px;box-shadow:var(--shadow);padding:16px 18px;z-index:600;
+  display:none;border:1px solid var(--line)}
+.panel h2{font-family:Fraunces,serif;font-size:21px;margin:0 28px 4px 0;line-height:1.15}
+.panel .x{position:absolute;right:12px;top:10px;border:0;background:none;color:var(--muted);font-size:20px;cursor:pointer}
+.panel p{margin:6px 0;color:var(--muted);font-size:12.5px}
+.field{width:100%;border:1px solid var(--line);background:var(--bg);color:var(--ink);border-radius:9px;padding:7px 10px;font:inherit}
+.row{display:flex;gap:8px;align-items:center;margin-top:8px;flex-wrap:wrap}
+.btn.primary{background:var(--ink);color:var(--panel);border-color:var(--ink)}
+.btn:disabled{opacity:.45;cursor:default}
+.drop{border:1.5px dashed var(--line);border-radius:12px;padding:16px;text-align:center;color:var(--muted);
+  font-size:12.5px;margin-top:10px;cursor:pointer}
+.drop.over{border-color:var(--front);background:var(--front-soft)}
+.runs{margin-top:10px;display:grid;gap:8px}
+.run{border:1px solid var(--line);border-radius:11px;padding:8px 10px;display:grid;grid-template-columns:18px 1fr;gap:4px 8px}
+.run input[type=text],.run input[type=date]{border:0;border-bottom:1px solid var(--line);background:transparent;color:var(--ink);
+  font:600 13px Inter,sans-serif;padding:2px 0;width:100%}
+.run input[type=date]{font-weight:400;font-size:12px;width:auto}
+.run .meta{grid-column:2;font-size:11.5px;color:var(--muted)}
+.chip{display:inline-block;background:var(--chip);border-radius:999px;padding:2px 8px;font-size:11.5px;margin:2px 3px 0 0}
+.chip.done{background:color-mix(in srgb,var(--done) 22%,transparent)}
+.msg{font-size:12.5px;margin-top:8px;color:var(--muted)} .msg.err{color:#c0392b}
+.dstats{display:grid;grid-template-columns:repeat(4,1fr);gap:6px;margin:10px 0 4px}
+.dstats div{background:var(--chip);border-radius:10px;padding:6px 8px;font-size:10.5px;color:var(--muted)}
+.dstats b{display:block;font-size:15px;color:var(--ink);font-variant-numeric:tabular-nums}
+.vtx{width:12px;height:12px;border-radius:50%;background:var(--panel);border:2.5px solid var(--drawn);box-sizing:border-box}
+.vtx.end{background:var(--drawn)}
+.mid{width:10px;height:10px;border-radius:50%;background:var(--drawn);opacity:.35;border:0}
+.mid:hover{opacity:.9}
+.drawing #map{cursor:crosshair}
+.kbd{font-size:11px;color:var(--muted)}
+#card .step{font-size:10px;font-weight:600;letter-spacing:.09em;text-transform:uppercase;color:var(--muted);margin:14px 0 4px}
+#card .marks{font-size:11.5px;color:var(--muted);margin:4px 0 0;padding-left:18px;line-height:1.45}
+#card div.marks{padding-left:0}
+.bmark{background:#c0392b;color:#fff;border:2px solid #fff;border-radius:50%;font:600 10px/14px Inter,sans-serif;text-align:center;box-sizing:border-box}
+.hintflag span{position:relative;display:inline-block;background:var(--ink);color:var(--panel);font:600 11.5px Inter,sans-serif;padding:5px 9px;border-radius:9px;white-space:nowrap;box-shadow:var(--shadow);cursor:pointer}
+.hintflag span:after{content:'';position:absolute;left:0;top:100%;width:2px;height:9px;background:var(--ink)}
+.hintflag span:hover{background:var(--front)}
+#piNow{color:var(--ink)}
+.pi-tip{margin-top:2px}
+#promInfo details{margin-top:6px;line-height:1.4}
+#promInfo summary{cursor:pointer;color:var(--ink)}
+#promInfo{position:absolute;left:56px;bottom:24px;z-index:450;display:none;max-width:290px;background:var(--panel);
+  border:1px solid var(--line);border-radius:12px;padding:8px 10px;box-shadow:var(--shadow);font-size:11.5px;color:var(--muted)}
+#promInfo b{color:var(--ink)}
+#promInfo .ramp{display:flex;margin:6px 0 2px;border-radius:4px;overflow:hidden}
+#promInfo .ramp i{flex:1;height:8px}
+#promInfo .ticks{display:flex;font-size:10px}
+#promInfo .ticks span{flex:1}
+#promInfo input{width:100%;margin:6px 0 0}
+@media (max-width:820px){
+  .app{grid-template-columns:1fr;grid-template-rows:52vh 1fr}
+  aside{order:2;border-right:0;border-top:1px solid var(--line)}
+  header{padding:14px 16px 10px} h1{font-size:22px}
+  .controls,.pk,.foot{padding-left:16px;padding-right:16px}
+  #card,.panel{left:16px;right:16px;top:auto;bottom:16px;width:auto;max-height:45vh;overflow:auto}
+  /* drawing on a phone: give the map most of the screen and keep the tool small */
+  .drawing .app{grid-template-rows:82vh 1fr}
+  #drawPanel{left:8px;right:8px;bottom:8px;max-height:36vh;padding:10px 12px}
+  #drawPanel .eyebrow,#drawPanel .kbd.help,#dNotes,#dProfile{display:none}
+  .dstats{margin:6px 0 2px}
+}
 </style></head><body>
-<div id="map"></div>
-<div id="panel">
-  <h3>I-90 First-Row Peaks</h3>
-  <div class="muted">Seattle &rarr; Columbia River &middot; &ge;250&prime; prominence.
-    Click a peak to see why it's classified.</div>
-  <div class="row">
-    <label><input type="checkbox" class="cls" value="front" checked>
-      <span class="sw" style="background:#2ca02c"></span>First row &mdash; clear approach
-      (<b id="n_front">0</b>)</label><br>
-    <label><input type="checkbox" class="cls" value="behind">
-      <span class="sw" style="background:#999"></span>Behind a ridge &ge;250&prime;
-      (<b id="n_behind">0</b>)</label>
+<div class="app">
+<aside>
+  <header>
+    <div class="eyebrow">Running challenge · Seattle → Columbia River</div>
+    <h1>The I-90 Peaks</h1>
+    <div class="sub">Every summit with ≥250 ft of prominence that stands in the first row along
+      I-90, with no other qualifying peak or ridge between it and the highway.</div>
+    <div class="stats">
+      <div class="stat"><b id="s_front">–</b><span>first-row peaks</span></div>
+      <div class="stat"><b id="s_done">–</b><span>summited</span></div>
+      <div class="stat"><b id="s_gain">–</b><span>to go</span></div>
+    </div>
+    <div class="bar"><i id="s_bar"></i></div>
+    <div class="nav" id="nav"></div>
+    <div class="nav"><button id="addRunsBtn">+ Add runs</button><button id="drawBtn">✎ Draw a route</button></div>
+  </header>
+  <div class="controls">
+    <div class="seg" id="seg">
+      <button data-v="front" class="on">First row</button>
+      <button data-v="todo">To do</button>
+      <button data-v="done">Done</button>
+      <button data-v="all">All peaks</button>
+    </div>
+    <input type="search" id="q" placeholder="Search peaks by name…">
+    <div class="range">Prominence ≥ <b id="pval">250</b> ft
+      <input id="prom" type="range" min="250" max="3000" step="50" value="250"></div>
+    <div class="toggles">
+      <label title="visible from zoom 11"><input type="checkbox" autocomplete="off" id="t_caps" checked> summit caps</label>
+      <label><input type="checkbox" autocomplete="off" id="t_tracks" checked> my tracks</label>
+      <label><input type="checkbox" autocomplete="off" id="t_routes" checked> planned routes</label>
+      <label><input type="checkbox" autocomplete="off" id="t_drawn" checked> drawn routes</label>
+      <label title="the ground each peak rises above its key col, coloured by prominence"><input type="checkbox" autocomplete="off" id="t_prom" checked> prominence islands</label>
+    </div>
   </div>
-  <div class="row">Min prominence: <b id="pval">250</b> ft
-    <input id="prom" type="range" min="250" max="__MAXPROM__" step="50" value="250"></div>
-  <div class="row">
-    <label><input type="checkbox" id="lines"> show approach lines (visible peaks)</label>
-  </div>
-  <div class="row muted">Showing <b id="count">0</b> peaks</div>
-  <div id="chart"></div>
-  <div class="row">
-    <button onclick="dl('gpx')">Export GPX</button>
-    <button class="alt" onclick="dl('geojson')">GeoJSON</button>
-  </div>
-  <div class="row muted">GPX/GeoJSON import directly into CalTopo. Export = visible peaks.</div>
+  <div id="list"></div>
+  <div class="foot"><span class="sub" id="count"></span><span class="sp"></span>
+    <button class="btn" onclick="dl('gpx')">GPX</button>
+    <button class="btn" onclick="dl('geojson')">GeoJSON</button></div>
+</aside>
+<div style="position:relative;min-height:0">
+  <div id="map"></div>
+  <div id="card"><button class="x" onclick="closeCard()">×</button><div id="cardBody"></div></div>
+  <div id="promInfo"></div>
+  <div class="panel" id="uploadPanel"><button class="x" onclick="closeUpload()">×</button>
+    <div class="eyebrow">CalTopo → map</div><h2>Add runs</h2>
+    <p>Export a track from CalTopo (Export → GeoJSON) and drop it here. Each line becomes a run; any first-row
+      summit it tops out on (within 120 m of the summit and 40 ft of its height) is checked off. The ends of each run
+      and anything near home are trimmed before the line is published.</p>
+    <div id="upAuth"></div><div id="upBody"></div></div>
+  <div class="panel" id="drawPanel"><button class="x" onclick="stopDraw()">×</button>
+    <div class="eyebrow">Route tool</div>
+    <input class="field" id="dName" placeholder="Route name" style="font:600 16px Fraunces,serif;margin-top:4px">
+    <div class="dstats"><div><b id="dDist">0.0</b>miles</div><div><b id="dGain">0</b>ft gain</div>
+      <div><b id="dLoss">0</b>ft loss</div><div><b id="dTime">–</b>est. hours</div></div>
+    <div id="dProfile"></div><div id="dPeaks" style="margin-top:6px"></div>
+    <div class="kbd help" style="margin-top:6px">Click the map to add points · drag points to move · drag a faint midpoint to
+      insert · double-click or right-click a point to delete · Ctrl+Z undo</div>
+    <div class="row"><label class="kbd"><input type="checkbox" id="dSnap" checked> snap to summits</label>
+      <label class="kbd"><input type="checkbox" id="dOff"> mostly off-trail</label></div>
+    <textarea class="field" id="dNotes" rows="2" placeholder="Notes (access, scramble, water…)" style="margin-top:8px"></textarea>
+    <div class="row"><button class="btn" onclick="undo()">Undo</button><button class="btn" onclick="reverseRoute()">Reverse</button>
+      <button class="btn" onclick="clearRoute()">Clear</button><span style="flex:1"></span>
+      <button class="btn" onclick="exportDrawn()">GPX</button><button class="btn primary" id="dSave" onclick="saveDrawn()">Save</button></div>
+    <div class="msg" id="dMsg"></div></div>
+  <button class="btn theme" id="themeBtn" title="Toggle light/dark">◐</button>
+</div>
 </div>
 <script>
-const PEAKS=__PEAKS__, HIGHWAY=__HIGHWAY__, DETAILS=__DETAILS__, CENTER=__CENTER__;
-const COLOR={front:'#2ca02c',behind:'#999'};
-const LABEL={front:'FIRST ROW — clear approach from I-90',
-             behind:'BEHIND a ridge ≥250 ft'};
-const FT=3.280839895;
-const map=L.map('map').setView(CENTER,10);
-const topo=L.tileLayer('https://{s}.tile.opentopomap.org/{z}/{x}/{y}.png',
-  {maxZoom:17,attribution:'© OpenTopoMap'}).addTo(map);
-const sat=L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{x}/{y}',
-  {maxZoom:18,attribution:'© Esri'});
-const street=L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',
-  {maxZoom:19,attribution:'© OSM'});
-L.control.layers({'Topo':topo,'Satellite':sat,'Street':street}).addTo(map);
-L.geoJSON(HIGHWAY,{style:{color:'#1f77b4',weight:3}}).addTo(map);
+const D=__DATA__;
+const P=D.peaks.features, DET=D.details;
+const css=n=>getComputedStyle(document.documentElement).getPropertyValue(n).trim();
+const nameOf=p=>p.name||`Pt ${p.elev_ft}`;
+const fmt=n=>n.toLocaleString();
 
-const counts={front:0,behind:0};
-PEAKS.features.forEach(f=>counts[f.properties.cls]++);
-for(const k in counts) document.getElementById('n_'+k).textContent=counts[k];
+const esc=s=>String(s??'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/"/g,'&quot;');
+const API='/i90peaks/api';
+let STATE=null;   // live state from the site (runs, summits, drawn routes); null = static page
 
-const layer=L.layerGroup().addTo(map);      // peak markers
-const lineLayer=L.layerGroup().addTo(map);  // approach lines for all visible
-const pickLayer=L.layerGroup().addTo(map);  // highlighted clicked approach
-const radius=p=>Math.max(3,Math.min(11,2+Math.sqrt(p)/12));
-const activeClasses=()=>new Set([...document.querySelectorAll('.cls:checked')].map(c=>c.value));
-function visiblePeaks(){
-  const minP=+document.getElementById('prom').value, cl=activeClasses();
-  return PEAKS.features.filter(f=>f.properties.prom_ft>=minP && cl.has(f.properties.cls));
+// ---- header stats
+function updateStats(){
+  const front=P.filter(f=>f.properties.front), done=front.filter(f=>f.properties.done);
+  document.getElementById('s_front').textContent=front.length;
+  document.getElementById('s_done').textContent=done.length;
+  document.getElementById('s_gain').textContent=front.length-done.length;
+  requestAnimationFrame(()=>document.getElementById('s_bar').style.width=(100*done.length/Math.max(1,front.length))+'%');
 }
-function lerp(a,b,t){return [a[0]+(b[0]-a[0])*t, a[1]+(b[1]-a[1])*t];}
+updateStats();
+document.getElementById('nav').innerHTML=D.links.map(l=>`<a href="${l.href}">${l.label}</a>`).join('');
+document.getElementById('prom').max=Math.ceil(Math.max(...P.map(f=>f.properties.prom_ft))/50)*50;
 
-function profileChart(d,nm){
-  const z=d.z,n=z.length,W=262,H=120,pad=16;
+// ---- map
+const map=L.map('map',{zoomControl:false,preferCanvas:true});
+L.control.zoom({position:'bottomright'}).addTo(map);
+const bases={
+  'Terrain':L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Topo_Map/MapServer/tile/{z}/{y}/{x}',{maxZoom:19,attribution:'Esri, USGS'}),
+  'Topo (contours)':L.tileLayer('https://{s}.tile.opentopomap.org/{z}/{x}/{y}.png',{maxZoom:17,attribution:'© OpenTopoMap © OSM'}),
+  'Satellite':L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',{maxZoom:19,attribution:'Esri'}),
+  'Dark':L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png',{maxZoom:19,attribution:'© CARTO © OSM'}),
+};
+const dark=matchMedia('(prefers-color-scheme: dark)').matches;
+(dark?bases['Dark']:bases['Terrain']).addTo(map);
+L.control.layers(bases,null,{position:'topleft'}).addTo(map);
+
+const hwLayer=L.geoJSON(D.highway,{style:()=>({color:css('--hw'),weight:4,opacity:.85})}).addTo(map);
+map.fitBounds(hwLayer.getBounds(),{padding:[20,20]});
+const capLayer=L.geoJSON(D.caps,{filter:f=>f.properties.front,interactive:false,
+  style:()=>({color:css('--front'),weight:1,opacity:.6,fillColor:css('--front'),fillOpacity:.13})}).addTo(map);
+const trackLayer=L.geoJSON(D.tracks,{style:f=>({color:css('--track'),weight:3,opacity:.8}),
+  onEachFeature:trackPopup}).addTo(map);
+function trackPopup(f,l){const p=f.properties;
+  l.bindTooltip(esc(p.name||'run'),{sticky:true});
+  l.bindPopup(()=>`<b>${esc(p.name||'Run')}</b><br>${esc(p.date||p.run_date||'')}${p.dist_mi?` · ${p.dist_mi} mi`:''}${p.gain_ft?` · ${fmt(Math.round(p.gain_ft))} ft`:''}`+
+    (STATE?.owner&&p.uuid&&p.source==='caltopo'?`<br><a href="#" onclick="deleteRun('${p.uuid}');return false">Delete this run</a>`:''));}
+const routeLayer=L.geoJSON(D.routes,{style:f=>({color:css('--route'),weight:3.5,opacity:.9,dashArray:f.properties.fallback?'2 6':'7 6'}),
+  onEachFeature:(f,l)=>l.bindPopup(`<b>${esc(f.properties.name||'Planned route')}</b><br>${esc(f.properties.desc||'')}`+
+    `<br><a href="#" onclick="editPlanned(${f.properties.route_id});return false">✎ Edit in the route tool</a>`)}).addTo(map);
+const drawnLayer=L.geoJSON(null,{style:()=>({color:css('--drawn'),weight:4,opacity:.95}),
+  onEachFeature:(f,l)=>{const p=f.properties;
+    l.bindTooltip(esc(p.name),{sticky:true});
+    l.bindPopup(()=>`<b>${esc(p.name)}</b><br>${p.dist_mi??'–'} mi · ${p.gain_ft!=null?fmt(Math.round(p.gain_ft)):'–'} ft · ~${p.est_hours??'–'} h`+
+      (p.notes?`<br><i>${esc(p.notes)}</i>`:'')+`<br><a href="#" onclick="editDrawn('${p.id}');return false">✎ ${STATE?.owner?'Edit':'Open in route tool'}</a>`+
+      ` · <a href="#" onclick="gpxOfDrawn('${p.id}');return false">GPX</a>`+
+      (STATE?.owner?` · <a href="#" onclick="deleteDrawn('${p.id}');return false">Delete</a>`:''));}}).addTo(map);
+const pickLayer=L.layerGroup().addTo(map);
+const peakLayer=L.layerGroup().addTo(map);
+
+let mode='front', selected=null;
+const radius=p=>Math.max(3.5,Math.min(12,2.5+Math.sqrt(p)/9));
+function colorOf(p){return p.done?css('--done'):p.front?css('--front'):css('--behind');}
+function visible(){
+  const minP=+document.getElementById('prom').value, q=document.getElementById('q').value.trim().toLowerCase();
+  return P.filter(f=>{const p=f.properties;
+    if(p.prom_ft<minP) return false;
+    if(q && !nameOf(p).toLowerCase().includes(q)) return false;
+    if(mode==='front') return p.front;
+    if(mode==='todo') return p.front&&!p.done;
+    if(mode==='done') return p.done;
+    return true;});
+}
+function render(){
+  peakLayer.clearLayers();
+  const vis=visible();
+  const markers=[...vis].sort((a,b)=>a.properties.front-b.properties.front);
+  markers.forEach(f=>{const p=f.properties,c=f.geometry.coordinates,col=colorOf(p);
+    const m=L.circleMarker([c[1],c[0]],{radius:radius(p.prom_ft),color:p.front?'#fff':col,weight:p.front?1.5:1,
+      fillColor:col,fillOpacity:p.front?.95:.55});
+    m.bindTooltip(`<b>${nameOf(p)}</b><br>${fmt(p.elev_ft)} ft · P${fmt(p.prom_ft)}`,{direction:'top',offset:[0,-4]});
+    m.on('click',()=>{suppressClick=Date.now();if(!drawing) select(p.id,false);});
+    m.addTo(peakLayer);});
+  const sorted=[...vis].sort((a,b)=>b.properties.prom_ft-a.properties.prom_ft);
+  document.getElementById('list').innerHTML=sorted.map(f=>{const p=f.properties;
+    return `<div class="pk${selected===p.id?' sel':''}" data-id="${p.id}"><span class="dot" style="background:${colorOf(p)}"></span>
+      <div><div class="nm">${p.done?'✓ ':''}${nameOf(p)}</div><div class="meta">P${fmt(p.prom_ft)} ft · ${p.near_mi} mi from I-90</div></div>
+      <div class="el">${fmt(p.elev_ft)}′</div></div>`;}).join('');
+  document.getElementById('count').textContent=`${vis.length} peaks`;
+}
+document.getElementById('list').addEventListener('click',e=>{const r=e.target.closest('.pk'); if(r) select(+r.dataset.id,true);});
+document.querySelectorAll('#seg button').forEach(b=>b.onclick=()=>{
+  document.querySelectorAll('#seg button').forEach(x=>x.classList.remove('on'));b.classList.add('on');mode=b.dataset.v;render();});
+document.getElementById('q').addEventListener('input',render);
+document.getElementById('prom').addEventListener('input',e=>{document.getElementById('pval').textContent=e.target.value;render();});
+const tog=(id,layer)=>document.getElementById(id).addEventListener('change',e=>e.target.checked?layer.addTo(map):map.removeLayer(layer));
+// caps clutter the overview (flat lowland hills have huge caps): show from zoom 11
+const capsOn=()=>document.getElementById('t_caps').checked&&map.getZoom()>=11;
+const syncCaps=()=>capsOn()?capLayer.addTo(map):map.removeLayer(capLayer);
+map.on('zoomend',syncCaps);document.getElementById('t_caps').addEventListener('change',syncCaps);syncCaps();tog('t_tracks',trackLayer);tog('t_routes',routeLayer);tog('t_drawn',drawnLayer);
+
+// ---- prominence islands + point check
+// Index PNG (pixel RGB = peak id + 1, see promraster.py): coloured here by the owning
+// peak's prominence, read back on hover ("whose ground is this"), and outlined to show
+// a peak's whole island (its own ground plus every island nested in it).
+const PROM_STOPS=[250,400,600,1000,2000,4000];
+const PROM_COLS=['#fcfdbf','#feb078','#f1605d','#b63679','#721f81','#2c115f'];
+const promCol=v=>{let k=0;while(k<PROM_STOPS.length-1&&v>=PROM_STOPS[k+1])k++;return PROM_COLS[k];};
+const TOL_M=76.2;            // 250 ft, the rule's threshold
+const PAR=D.prom?.parent||[];
+let promLayer=null,promIdx=null,promCtx=null,promBase=null,promBox=null,promOpacity=.6,outlined=-1,outlineBox=null;
+map.createPane('prom').style.zIndex=350;          // under the routes and markers
+// Leaflet's ImageOverlay only takes an <img>; this lets it place a canvas we can redraw in place
+const CanvasOverlay=L.ImageOverlay.extend({_initImage(){const c=this._image=this._url;
+  L.DomUtil.addClass(c,'leaflet-image-layer');if(this._zoomAnimated)L.DomUtil.addClass(c,'leaflet-zoom-animated');
+  c.onselectstart=L.Util.falseFn;c.onmousemove=L.Util.falseFn;this._updateOpacity();}});
+async function loadProm(){
+  const img=new Image();
+  img.src=/\.html$/.test(location.pathname)?'prominence.png':'/i90peaks/prominence.png';
+  await img.decode();
+  const [w,h]=[img.width,img.height],cv=document.createElement('canvas');cv.width=w;cv.height=h;
+  promCtx=cv.getContext('2d',{willReadFrequently:true});promCtx.drawImage(img,0,0);
+  const px=promCtx.getImageData(0,0,w,h),d=px.data;promIdx=new Int32Array(w*h);
+  const lut=P.map(f=>{const c=promCol(f.properties.prom_ft);return [1,3,5].map(i=>parseInt(c.slice(i,i+2),16));});
+  promBox=P.map(()=>[1e9,1e9,-1,-1]);
+  for(let i=0,j=0;i<promIdx.length;i++,j+=4){
+    const id=(d[j]<<16|d[j+1]<<8|d[j+2])-1;promIdx[i]=id;
+    if(id<0){d[j+3]=0;continue;}
+    const c=lut[id]||[128,128,128];d[j]=c[0];d[j+1]=c[1];d[j+2]=c[2];d[j+3]=255;
+    const b=promBox[id],x=i%w,y=(i/w)|0;
+    if(x<b[0])b[0]=x;if(y<b[1])b[1]=y;if(x>b[2])b[2]=x;if(y>b[3])b[3]=y;}
+  // an island's box must cover the islands nested in it: grow parents' boxes, deepest first
+  const depth=i=>{let n=0;while(PAR[i]>=0){i=PAR[i];n++;}return n;};
+  [...P.keys()].sort((a,b)=>depth(b)-depth(a)).forEach(i=>{const q=PAR[i];if(q==null||q<0||promBox[i][2]<0)return;
+    const a=promBox[i],b=promBox[q];b[0]=Math.min(b[0],a[0]);b[1]=Math.min(b[1],a[1]);b[2]=Math.max(b[2],a[2]);b[3]=Math.max(b[3],a[3]);});
+  promCtx.putImageData(px,0,0);promBase=px;
+  promLayer=new CanvasOverlay(cv,D.prom.bounds,{pane:'prom',opacity:promOpacity,interactive:false});
+}
+function promAt(ll){
+  if(!promIdx) return -1;
+  const [[s,w],[n,e]]=D.prom.bounds,[W,H]=D.prom.size,pr=x=>L.CRS.EPSG3857.project(x);
+  const a=pr(L.latLng(s,w)),b=pr(L.latLng(n,e)),p=pr(ll);
+  const x=Math.floor((p.x-a.x)/(b.x-a.x)*W),y=Math.floor((b.y-p.y)/(b.y-a.y)*H);
+  return x<0||y<0||x>=W||y>=H?-1:promIdx[y*W+x];
+}
+const inIsland=(id,root)=>{while(id>=0){if(id===root)return true;id=PAR[id]??-1;}return false;};
+function outline(root){       // ink the edge of root's whole island; restore the last one
+  if(!promCtx||root===outlined) return;
+  const [W,H]=D.prom.size,cx=promCtx;
+  if(outlineBox){const [x0,y0,x1,y1]=outlineBox;cx.putImageData(promBase,0,0,x0,y0,x1-x0+1,y1-y0+1);}
+  outlined=root;outlineBox=null;
+  if(root<0||promBox[root][2]<0) return;
+  const b=promBox[root],x0=Math.max(0,b[0]-1),y0=Math.max(0,b[1]-1),x1=Math.min(W-1,b[2]+1),y1=Math.min(H-1,b[3]+1);
+  const w=x1-x0+1,h=y1-y0+1,img=cx.getImageData(x0,y0,w,h),d=img.data,memo=new Map();
+  const inside=(x,y)=>{if(x<0||y<0||x>=W||y>=H)return false;const id=promIdx[y*W+x];if(id<0)return false;
+    let v=memo.get(id);if(v===undefined){v=inIsland(id,root);memo.set(id,v);}return v;};
+  const ink=[0,229,255];             // cyan: in neither the palette nor the basemaps
+  for(let y=0;y<h;y++)for(let x=0;x<w;x++){const X=x0+x,Y=y0+y;
+    if(inside(X,Y)&&!(inside(X-1,Y)&&inside(X+1,Y)&&inside(X,Y-1)&&inside(X,Y+1))){const j=(y*w+x)*4;d[j]=ink[0];d[j+1]=ink[1];d[j+2]=ink[2];d[j+3]=255;}}
+  cx.putImageData(img,x0,y0);outlineBox=[x0,y0,x1,y1];
+}
+
+// ---- info box: elevation + whose ground under the pointer, and the colour key
+const tProm=document.getElementById('t_prom'),infoBox=document.getElementById('promInfo');
+infoBox.innerHTML=`<div id="piNow">Hover the map for elevation</div>
+  <div class="pi-tip">Click any point to see why it is or isn't a target.</div>
+  <div id="piKey"><div class="ramp">${PROM_COLS.map(c=>`<i style="background:${c}"></i>`).join('')}</div>
+  <div class="ticks">${PROM_STOPS.map(v=>`<span>${fmt(v)}+</span>`).join('')}</div>
+  <details><summary>Prominence islands: how to read the colours</summary>A peak's island is the ground above its
+  <b>key col</b>, the low point you must drop to before reaching anything higher. Each spot is coloured by the
+  prominence (ft) of the <i>smallest</i> island it sits in. A big mountain owns its lower slopes, while the
+  smaller bumps on top own the summit area, so tops can look paler than the slopes below.
+  Hover anywhere to outline the whole island of the peak that owns it.</details>
+  <input type="range" min="15" max="100" value="${promOpacity*100}" aria-label="island opacity"></div>`;
+infoBox.style.display='block';
+infoBox.querySelector('input').oninput=e=>{promOpacity=e.target.value/100;promLayer?.setOpacity(promOpacity);};
+let hoverId=-1,hoverZ=null,hoverLL=null,zBusy=false;
+function showNow(){
+  const z=hoverZ==null?'':`<b>${fmt(Math.round(hoverZ/0.3048))} ft</b>`;
+  let t;
+  if(hoverId>=0){const p=P[hoverId].properties;t=`${z}${z?' · ':''}<b>${esc(nameOf(p))}</b>'s ground (P${fmt(p.prom_ft)})`;}
+  else t=z?`${z} · below every key col: no peak's ground`:'Hover the map for elevation';
+  document.getElementById('piNow').innerHTML=t;
+}
+async function pumpZ(){zBusy=true;while(hoverLL){const ll=hoverLL;hoverLL=null;hoverZ=await elevAt(ll.lat,ll.lng);showNow();}zBusy=false;}
+map.on('mousemove',e=>{if(typeof drawing!=='undefined'&&drawing) return;
+  const id=promAt(e.latlng);if(id!==hoverId){hoverId=id;if(tProm.checked)outline(id);}
+  hoverLL=e.latlng;if(!zBusy)pumpZ();showNow();});
+map.on('mouseout',()=>{hoverId=-1;outline(-1);});
+const promReady=D.prom?loadProm():Promise.resolve();
+if(D.prom){
+  const sync=async()=>{document.getElementById('piKey').style.display=tProm.checked?'':'none';
+    if(!tProm.checked){if(promLayer)map.removeLayer(promLayer);outline(-1);return;}
+    await promReady;if(tProm.checked)promLayer.addTo(map);};
+  tProm.addEventListener('change',sync);sync();
+}else{tProm.parentElement.style.display='none';document.getElementById('piKey').style.display='none';}
+
+// ---- point check: why is (or isn't) this spot a target?
+const geo=(a,b)=>{const r=Math.PI/180,dLa=(b[0]-a[0])*r,dLo=(b[1]-a[1])*r,
+  s=Math.sin(dLa/2)**2+Math.cos(a[0]*r)*Math.cos(b[0]*r)*Math.sin(dLo/2)**2;return 2*6371008.8*Math.asin(Math.sqrt(s));};
+const compass=(a,b)=>{const t=Math.atan2((b[1]-a[1])*Math.cos(a[0]*Math.PI/180),b[0]-a[0])*180/Math.PI;
+  return ['N','NE','E','SE','S','SW','W','NW'][Math.round(((t+360)%360)/45)%8];};
+const ll2=f=>[f.geometry.coordinates[1],f.geometry.coordinates[0]];
+const mi=m=>(m/1609.344).toFixed(1);
+let capIdx=null;
+function capAt(lat,lng){   // which summit cap (top 250 ft of a qualifying peak) contains this point
+  if(!capIdx) capIdx=D.caps.features.map(f=>{const g=f.geometry,polys=g.type==='Polygon'?[g.coordinates]:g.coordinates,
+    xs=polys.flat(2).map(c=>c[0]),ys=polys.flat(2).map(c=>c[1]);
+    return {id:f.properties.id,polys,b:[Math.min(...xs),Math.min(...ys),Math.max(...xs),Math.max(...ys)]};});
+  const ring=(r)=>{let o=false;for(let i=0,j=r.length-1;i<r.length;j=i++){const [xi,yi]=r[i],[xj,yj]=r[j];
+    if((yi>lat)!==(yj>lat)&&lng<(xj-xi)*(lat-yi)/(yj-yi)+xi)o=!o;}return o;};
+  for(const c of capIdx){if(lng<c.b[0]||lng>c.b[2]||lat<c.b[1]||lat>c.b[3])continue;
+    if(c.polys.some(p=>ring(p[0])&&!p.slice(1).some(ring)))return c.id;}
+  return -1;
+}
+// Re-walk a stored I-90 approach with the classifier's rule (adjacency._walk), listing every
+// barrier on the way rather than only the first: other peaks' caps, separate ridges (a rise of
+// >= 250 ft followed by a drop of >= 250 ft), and ground higher than the summit.
+function barriers(d,id){
+  const z=d.z,n=z.length,top=P[id].properties.elev_ft*0.3048,out=[];
+  const road=z.find(v=>v!=null);
+  let lo=Infinity,ridge=-Infinity,ridgeK=0,ridgeRise=0,inCap=-1,inHigh=false;
+  for(let k=0;k<n;k++){const v=z[k];if(v==null)continue;const t=k/(n-1);
+    const cap=capAt(d.h[1]+(d.s[1]-d.h[1])*t,d.h[0]+(d.s[0]-d.h[0])*t);
+    if(cap===id) break;                                   // reached this peak's own cap
+    if(cap>=0){if(cap!==inCap)out.push({t,kind:'cap',who:cap});inCap=cap;continue;}
+    inCap=-1;
+    const high=v>top&&v>road+30;
+    if(high&&!inHigh)out.push({t,kind:'higher',z:v});inHigh=high;
+    if(v<=ridge-TOL_M){out.push({t:ridgeK/(n-1),kind:'ridge',rise:ridgeRise,drop:ridge-v});lo=v;ridge=-Infinity;continue;}
+    if(v<lo)lo=v;else if(v-lo>=TOL_M&&v>ridge){ridge=v;ridgeK=k;ridgeRise=v-lo;}
+  }
+  return out;
+}
+function barrierText(b,len){
+  const at=`${mi(b.t*len)} mi out`;
+  if(b.kind==='cap') return `${at}: crosses the summit cap of <a href="#" onclick="select(${b.who},true);return false">${esc(nameOf(P[b.who].properties))}</a> (P${fmt(P[b.who].properties.prom_ft)})`;
+  if(b.kind==='higher') return `${at}: ground at ${fmt(Math.round(b.z/0.3048))} ft, higher than the summit`;
+  return `${at}: a separate ridge, rising ${fmt(Math.round(b.rise/0.3048))} ft then dropping ${fmt(Math.round(b.drop/0.3048))}+ ft`;
+}
+function tallyText(d){
+  if(!d||!d.tried) return '';
+  const t=d.tally||{},parts=[],listed=(d.caps||[]).reduce((a,[,n])=>a+n,0);
+  if(t.ridge) parts.push(`${t.ridge} cross a separate ridge`);
+  (d.caps||[]).forEach(([id,n])=>parts.push(`${n} hit ${esc(nameOf(P[id].properties))}'s summit cap`));
+  if((t.peak||0)>listed) parts.push(`${t.peak-listed} hit other peaks' caps`);
+  if(t.higher) parts.push(`${t.higher} meet ground higher than the summit`);
+  return `Of ${d.tried} straight lines tried from points along I-90, none reaches its summit cap cleanly: ${parts.join(', ')}.`;
+}
+function chart(z,o){   // elevation profile (metres along a line), with barrier marks
+  const W=320,H=92,px=6,py=14,n=z.length,vals=z.filter(v=>v!=null);if(vals.length<2)return'';
+  const mn=Math.min(...vals),mx=Math.max(...vals),span=Math.max(1,mx-mn);
+  const X=t=>px+(W-2*px)*t,Y=v=>H-py-(H-py-12)*(v-mn)/span,col=o.col||css('--muted');
+  const pts=[];z.forEach((v,i)=>{if(v!=null)pts.push(X(i/(n-1)).toFixed(1)+','+Y(v).toFixed(1));});
+  const ft=v=>fmt(Math.round(v/0.3048));
+  let s=`<svg viewBox="0 0 ${W} ${H}" width="100%" style="display:block;margin-top:4px;overflow:visible">`+
+    `<path d="M${X(0)},${H-py} L${pts.join(' L')} L${X(1)},${H-py} Z" fill="${col}" opacity=".15"/>`+
+    `<polyline points="${pts.join(' ')}" fill="none" stroke="${col}" stroke-width="2"/>`;
+  (o.marks||[]).forEach((m,i)=>{const x=X(m.t);s+=`<line x1="${x}" x2="${x}" y1="8" y2="${H-py}" stroke="#c0392b" stroke-dasharray="3 3"/>`+
+    `<circle cx="${x}" cy="8" r="6.5" fill="#c0392b"/><text x="${x}" y="11" font-size="9" fill="#fff" text-anchor="middle" font-weight="600">${i+1}</text>`;});
+  return s+`<text x="${px}" y="${H-1}" font-size="9.5" fill="${css('--muted')}">${esc(o.from)} · ${ft(vals[0])} ft</text>`+
+    `<text x="${W-px}" y="${H-1}" font-size="9.5" fill="${css('--muted')}" text-anchor="end">${esc(o.to)} · ${ft(vals[vals.length-1])} ft · ${mi(o.len)} mi</text></svg>`;
+}
+async function sampleLine(a,b,n=48){return Promise.all([...Array(n)].map((_,i)=>elevAt(a[0]+(b[0]-a[0])*i/(n-1),a[1]+(b[1]-a[1])*i/(n-1))));}
+let suppressClick=0,demoOpen=false;      // layer clicks set suppressClick so the map click skips them
+const hintSeen=()=>{try{localStorage.setItem('i90_hint_seen','1');}catch(e){}};
+[routeLayer,trackLayer,drawnLayer].forEach(l=>l.on('click',()=>suppressClick=Date.now()));
+map.on('click',e=>{if((typeof drawing!=='undefined'&&drawing)||Date.now()-suppressClick<400)return;inspect(e.latlng);});
+
+async function inspect(ll,demo=false){
+  await promReady;
+  const here=[ll.lat,ll.lng],own=promAt(ll),body=document.getElementById('cardBody');
+  hidePanels();selected=null;pickLayer.clearLayers();demoOpen=demo;render();
+  if(!demo) hintSeen();             // they've found the check themselves
+  L.circleMarker(here,{radius:7,color:'#fff',weight:2.5,fillColor:css('--ink'),fillOpacity:1}).addTo(pickLayer);
+  body.innerHTML=`<div class="eyebrow">${demo?'Example · try it on any point':'Point check'}</div><h2>Checking…</h2>`;
+  document.getElementById('card').style.display='block';
+  const z=await elevAt(...here);
+  let html='',bounds=[here];
+  const p=own>=0?P[own].properties:null,top=own>=0?ll2(P[own]):null,dTop=own>=0?geo(here,top):0;
+  const atTop=own>=0&&dTop<200;
+  html+=`<div class="eyebrow">${demo?'Example · try it on any point':'Point check'}</div>`+
+    `<h2>${atTop?esc(nameOf(p)):`${z==null?'–':fmt(Math.round(z/0.3048))} ft here`}</h2>`;
+  if(demo) html+=`<div class="verdict ok" style="background:var(--chip)">Why isn't ${esc(nameOf(p))} a target, with ${fmt(p.prom_ft)} ft of prominence, only ${p.near_mi} mi from I-90? Here's the data. <b>Click anywhere on the map</b> (tap on a phone) to run the same check on any spot.</div>`;
+
+  // 1. is it a peak?
+  html+=`<div class="step">1 · Is it a peak?</div>`;
+  if(own<0) html+=`<div class="verdict no">No. This ground is below the key col of every 250 ft peak around it, so it belongs to no qualifying peak (valley floor, or a bump with under 250 ft of prominence).</div>`;
+  else if(atTop) html+=`<div class="verdict ok">Yes: the summit of ${esc(nameOf(p))}, ${fmt(p.elev_ft)} ft with ${fmt(p.prom_ft)} ft of prominence (≥ 250 ft).</div>`;
+  else{
+    html+=`<div class="verdict no">Not on its own. It's on <b>${esc(nameOf(p))}</b>'s ground: above its key col (${fmt(p.elev_ft-p.prom_ft)} ft) and below its summit (${fmt(p.elev_ft)} ft, ${mi(dTop)} mi ${compass(here,top)}). There's no 250 ft drop separating this spot from it.</div>`;
+    const zt=await sampleLine(here,top);
+    html+=chart(zt,{from:'here',to:nameOf(p),len:dTop,col:css('--ink')});
+    L.polyline([here,top],{color:css('--ink'),weight:2.5,dashArray:'2 5'}).addTo(pickLayer);bounds.push(top);
+  }
+
+  // 2. is that peak a target?
+  let target=own>=0&&p.front;
+  if(own>=0){
+    const d=DET[own];
+    html+=`<div class="step">2 · Is ${esc(nameOf(p))} a target?</div>`;
+    if(p.front) html+=`<div class="verdict ok"><b>Yes.</b> A straight line from I-90 reaches its top-250 ft cap with nothing qualifying in between.</div>`;
+    else if(d&&d.kind==='far_lowland') html+=`<div class="verdict no"><b>No.</b> Nothing ≥ 250 ft stands between it and I-90, but it's a lowland hill (under 1,500 ft) ${p.near_mi} mi out; lowland hills only count within 4 mi.</div>`;
+    else html+=`<div class="verdict no"><b>No: it's behind the first row.</b> ${tallyText(d)}</div>`;
+    if(d){
+      const h=[d.h[1],d.h[0]],s=[d.s[1],d.s[0]],bs=p.front?[]:barriers(d,own);
+      html+=chart(d.z,{from:'I-90',to:nameOf(p),len:d.len,marks:bs,col:p.front?css('--front'):css('--behind')});
+      if(bs.length) html+=`<ol class="marks">${bs.map(b=>`<li>${barrierText(b,d.len)}</li>`).join('')}</ol>`+
+        `<div class="marks">The nearest approach (from ${mi(geo(h,s))} mi away) is shown; the rule needs just one clean line.</div>`;
+      L.polyline([h,s],{color:p.front?css('--front'):'#c0392b',weight:3}).addTo(pickLayer);
+      L.circleMarker(h,{radius:6,color:'#fff',weight:2,fillColor:css('--hw'),fillOpacity:1}).addTo(pickLayer);
+      bs.forEach((b,i)=>L.marker([h[0]+(s[0]-h[0])*b.t,h[1]+(s[1]-h[1])*b.t],{icon:L.divIcon({className:'bmark',html:String(i+1),iconSize:[18,18]})}).addTo(pickLayer));
+      bounds.push(h,s);
+    }
+  }
+
+  // 3. the nearest target, and the ground between
+  if(!target){
+    let best=-1,bd=Infinity;P.forEach((f,i)=>{if(!f.properties.front)return;const dd=geo(here,ll2(f));if(dd<bd){bd=dd;best=i;}});
+    if(best>=0){const q=P[best].properties,t=ll2(P[best]);
+      html+=`<div class="step">3 · Nearest target</div><div class="verdict ok"><a href="#" onclick="select(${best},true);return false"><b>${esc(nameOf(q))}</b></a>, ${mi(bd)} mi ${compass(here,t)} (${fmt(q.elev_ft)} ft, P${fmt(q.prom_ft)}).</div>`;
+      html+=chart(await sampleLine(here,t),{from:'here',to:nameOf(q),len:bd,col:css('--front')});
+      L.polyline([here,t],{color:css('--front'),weight:2.5,dashArray:'7 6'}).addTo(pickLayer);bounds.push(t);}
+  }
+  body.innerHTML=html;
+  if(demo) map.flyToBounds(L.latLngBounds(bounds).pad(.25),{duration:.8});
+}
+// Moolock Mountain: a 931 ft-prominence peak 6.6 mi from I-90 that still isn't first row,
+// flagged on the map and walked through automatically on a first visit
+const DEMO=P.findIndex(f=>f.properties.name==='Moolock Mountain');
+if(DEMO>=0){
+  const at=L.latLng(...ll2(P[DEMO]));
+  L.marker(at,{icon:L.divIcon({className:'hintflag',html:'<span>Why isn\'t this a target?</span>',iconSize:null,iconAnchor:[0,33]}),zIndexOffset:1000})
+    .on('click',()=>{suppressClick=Date.now();inspect(at,true);}).addTo(map);
+  let seen=false;try{seen=localStorage.getItem('i90_hint_seen')==='1';}catch(e){}
+  if(!seen) promReady.then(()=>setTimeout(()=>inspect(at,true),400));
+}
+
+// ---- detail card
+function profileSVG(d){
+  const z=d.z,n=z.length,W=320,H=120,px=6,py=10;
   const vals=z.filter(v=>v!=null); if(vals.length<2) return '';
   const mn=Math.min(...vals),mx=Math.max(...vals),span=Math.max(1,mx-mn);
-  const X=i=>pad+(W-2*pad)*i/(n-1), Y=v=>H-pad-(H-2*pad)*(v-mn)/span;
-  let pts=''; z.forEach((v,i)=>{if(v!=null)pts+=X(i).toFixed(1)+','+Y(v).toFixed(1)+' ';});
-  const col=d.blk?'#d62728':'#2ca02c';
-  let s=`<svg width=${W} height=${H} style="background:#f6f6f6;border-radius:6px">`;
-  // summit reference level
-  const zs=z[n-1]; if(zs!=null) s+=`<line x1=${pad} y1=${Y(zs)} x2=${W-pad} y2=${Y(zs)} stroke=#ccc stroke-dasharray=2/>`;
-  s+=`<polyline fill=none stroke=${col} stroke-width=2 points="${pts}"/>`;
-  if(z[0]!=null) s+=`<circle cx=${X(0)} cy=${Y(z[0])} r=3.5 fill=#1f77b4/>`;            // road
-  if(d.lo>0&&z[d.lo]!=null) s+=`<circle cx=${X(d.lo)} cy=${Y(z[d.lo])} r=2.5 fill=#888/>`; // valley low
-  if(zs!=null) s+=`<circle cx=${X(n-1)} cy=${Y(zs)} r=3.5 fill=${col}/>`;                // summit
-  if(d.blk&&d.bar>=0&&z[d.bar]!=null){
-    s+=`<line x1=${X(d.bar)} y1=${pad} x2=${X(d.bar)} y2=${H-pad} stroke=#d62728 stroke-dasharray=3/>`;
-    s+=`<circle cx=${X(d.bar)} cy=${Y(z[d.bar])} r=3.5 fill=#d62728/>`;
-  }
-  s+='</svg>';
-  const verdict=d.blk
-    ? '<b style="color:#d62728">behind a ridge</b> — the climb from the valley drops &ge;250 ft at the red line (a qualifying barrier between it and I-90)'
-    : '<b style="color:#2ca02c">first row</b> — from the valley floor it climbs to the summit with no &ge;250 ft ridge in the way';
-  return `<div class="ttl">${nm}</div>`+s+
-    `<div class="muted"><span style="color:#1f77b4">●</span> nearest I-90 &nbsp;`+
-    `<span style="color:#888">●</span> valley low &nbsp;`+
-    `<span style="color:${col}">●</span> summit &middot; ${(d.len/1000).toFixed(1)} km approach<br>${verdict}</div>`;
+  const X=i=>px+(W-2*px)*i/(n-1), Y=v=>H-py-(H-2*py)*(v-mn)/span;
+  let pts=[];z.forEach((v,i)=>{if(v!=null)pts.push(X(i).toFixed(1)+','+Y(v).toFixed(1));});
+  const col=d.ok?css('--front'):css('--behind');
+  const area=`M${X(0)},${H} L${pts.join(' L')} L${X(n-1)},${H} Z`;
+  const k=Math.round(d.stop*(n-1)), xs=X(k);
+  let s=`<svg viewBox="0 0 ${W} ${H}" width="100%" style="display:block;margin-top:8px">`+
+    `<path d="${area}" fill="${col}" opacity=".16"/><polyline points="${pts.join(' ')}" fill="none" stroke="${col}" stroke-width="2"/>`+
+    `<line x1="${xs}" x2="${xs}" y1="0" y2="${H}" stroke="${d.ok?col:'#c0392b'}" stroke-dasharray="3 3"/>`+
+    `<circle cx="${X(0)}" cy="${Y(z[0]??mn)}" r="4" fill="${css('--hw')}"/>`+
+    `<circle cx="${X(n-1)}" cy="${Y(z[n-1]??mx)}" r="4" fill="${col}"/></svg>`;
+  return s+`<div class="legend"><span><i style="background:${css('--hw')}"></i>I-90</span>`+
+    `<span><i style="background:${d.ok?col:'#c0392b'}"></i>${d.ok?'enters summit cap':'blocked here'}</span>`+
+    `<span><i style="background:${col}"></i>summit</span><span>${(d.len/1609.344).toFixed(1)} mi line</span></div>`;
 }
-
-function drawPick(f){
+function select(id,fly){
+  selected=id; const f=P[id],p=f.properties,d=DET[id],c=f.geometry.coordinates;
   pickLayer.clearLayers();
-  const d=DETAILS[f.properties.id]; if(!d) return;
-  const h=[d.h[1],d.h[0]], s=[d.s[1],d.s[0]], col=d.blk?'#d62728':'#2ca02c';
-  L.polyline([h,s],{color:col,weight:3,opacity:.9}).addTo(pickLayer);
-  L.circleMarker(h,{radius:5,color:'#1f77b4',fillColor:'#1f77b4',fillOpacity:1}).addTo(pickLayer);
-  if(d.blk&&d.bar>=0){const b=lerp(h,s,d.bar/(d.z.length-1));
-    L.circleMarker(b,{radius:5,color:'#d62728',fillColor:'#d62728',fillOpacity:1})
-      .bindTooltip('blocking ridge').addTo(pickLayer);}
-  const nm=f.properties.name||(f.properties.elev_ft+'ft pk');
-  document.getElementById('chart').innerHTML=profileChart(d,nm+' — '+f.properties.elev_ft+' ft');
+  if(d){const h=[d.h[1],d.h[0]],s=[d.s[1],d.s[0]],e=[h[0]+(s[0]-h[0])*d.stop,h[1]+(s[1]-h[1])*d.stop];
+    L.polyline([h,e],{color:d.ok?css('--front'):'#c0392b',weight:3.5}).addTo(pickLayer);
+    L.polyline([e,s],{color:css('--muted'),weight:2,dashArray:'4 5'}).addTo(pickLayer);
+    L.circleMarker(h,{radius:6,color:'#fff',weight:2,fillColor:css('--hw'),fillOpacity:1}).addTo(pickLayer);
+    if(!d.ok) L.circleMarker(e,{radius:6,color:'#fff',weight:2,fillColor:'#c0392b',fillOpacity:1}).addTo(pickLayer);
+    if(fly) map.flyToBounds(L.latLngBounds([h,s]).pad(.35),{duration:.8});
+  } else if(fly) map.flyTo([c[1],c[0]],13);
+  let why;
+  if(p.front) why=`<div class="verdict ok"><b>First row.</b> A straight line from I-90 reaches this peak's top-250 ft cap without crossing another qualifying peak or any ground higher than the summit.</div>`;
+  else if(d&&d.kind==='peak'&&d.by>=0) why=`<div class="verdict no"><b>Behind.</b> The nearest approach from I-90 first crosses the cap of <a onclick="select(${d.by},true)">${nameOf(P[d.by].properties)}</a> (P${fmt(P[d.by].properties.prom_ft)}). ${tallyText(d)}</div>`;
+  else if(d&&d.kind==='far_lowland') why=`<div class="verdict no"><b>Not counted.</b> Nothing ≥250 ft stands between it and I-90, but it is a lowland hill (under 1,500 ft) ${p.near_mi} mi from the freeway. Lowland hills only count within 4 mi.</div>`;
+  else if(d&&d.kind==='ridge') why=`<div class="verdict no"><b>Behind.</b> The nearest approach from I-90 crosses a separate ridge: ground that rises at least 250 ft and then drops at least 250 ft before this peak. ${tallyText(d)}</div>`;
+  else if(d&&d.kind==='higher') why=`<div class="verdict no"><b>Behind.</b> The nearest approach from I-90 crosses ground higher than this summit. ${tallyText(d)}</div>`;
+  else why=`<div class="verdict no"><b>Behind.</b> No clean approach from I-90. ${tallyText(d)}</div>`;
+  if(p.access) why+=`<div class="verdict no">⚠ On the ${esc(p.access)}.</div>`;
+  if(p.done) why+=`<div class="verdict ok" style="background:color-mix(in srgb,var(--done) 18%,transparent)"><b>✓ Summited</b>${p.done_by.length?' on '+p.done_by.slice(0,4).map(esc).join(', '):''}</div>`;
+  if(STATE?.owner&&p.front){
+    const manual=(STATE.summits||[]).some(x=>x.peak_id===p.id&&x.how==='manual'&&!x.track_id);
+    why+=`<div class="row">${manual?`<button class="btn" onclick="unmarkPeak(${p.id})">Remove hand-marked summit</button>`:
+      `<input type="date" class="field" id="mDate" style="width:auto"><button class="btn" onclick="markPeak(${p.id})">✓ Mark summited</button>`}</div>`;}
+  document.getElementById('cardBody').innerHTML=
+    `<div class="eyebrow">${p.front?'First-row peak':'Behind the first row'}</div><h2>${nameOf(p)}</h2>`+
+    `<div class="kv"><div><b>${fmt(p.elev_ft)}′</b>elevation</div><div><b>${fmt(p.prom_ft)}′</b>prominence</div><div><b>${p.near_mi} mi</b>to I-90</div></div>`+
+    (d?profileSVG(d):'')+why+
+    `<div class="legend"><a class="btn" style="text-decoration:none" target="_blank" href="https://caltopo.com/map.html#ll=${c[1]},${c[0]}&z=15&b=mbt">Open in CalTopo ↗</a>`+
+    `<button class="btn" onclick="drawTo(${p.id})">✎ Draw a route here</button></div>`;
+  hidePanels();
+  document.getElementById('card').style.display='block';
+  render();
 }
+function closeCard(){document.getElementById('card').style.display='none';pickLayer.clearLayers();selected=null;
+  if(demoOpen){hintSeen();demoOpen=false;}render();}
 
-function render(){
-  layer.clearLayers(); lineLayer.clearLayers();
-  const vis=visiblePeaks(), showLines=document.getElementById('lines').checked;
-  vis.forEach(f=>{
-    const p=f.properties,c=f.geometry.coordinates,col=COLOR[p.cls];
-    if(showLines){const d=DETAILS[p.id];
-      if(d) L.polyline([[d.h[1],d.h[0]],[d.s[1],d.s[0]]],
-        {color:col,weight:1,opacity:.25}).addTo(lineLayer);}
-    const nm=p.name||(p.elev_ft+'ft pk');
-    const m=L.circleMarker([c[1],c[0]],{radius:radius(p.prom_ft),color:col,weight:1,
-      fillColor:col,fillOpacity:.85}).bindPopup(
-      `<b>${nm}</b><br>elev ${p.elev_ft} ft<br>prominence ${p.prom_ft} ft`+
-      `<br><b style="color:${col}">${LABEL[p.cls]}</b>`);
-    m.on('click',()=>drawPick(f));
-    m.addTo(layer);
-  });
-  document.getElementById('count').textContent=vis.length;
+// ---- theme toggle
+document.getElementById('themeBtn').onclick=()=>{
+  const r=document.documentElement, cur=r.dataset.theme||(dark?'dark':'light');
+  r.dataset.theme=cur==='dark'?'light':'dark';
+  hwLayer.setStyle({color:css('--hw')});capLayer.setStyle({color:css('--front'),fillColor:css('--front')});render();};
+
+// ---- exports
+function download(name,text,mime){const a=document.createElement('a');
+  a.href=URL.createObjectURL(new Blob([text],{type:mime}));a.download=name;a.click();}
+function dl(kind){
+  const vis=visible();
+  if(kind==='geojson'){download('i90_peaks.geojson',JSON.stringify({type:'FeatureCollection',features:vis}),'application/geo+json');return;}
+  const esc=s=>s.replace(/&/g,'&amp;').replace(/</g,'&lt;');
+  let g='<?xml version="1.0" encoding="UTF-8"?>\n<gpx version="1.1" creator="i90peaks" xmlns="http://www.topografix.com/GPX/1/1">\n';
+  vis.forEach(f=>{const p=f.properties,c=f.geometry.coordinates;
+    g+=`  <wpt lat="${c[1]}" lon="${c[0]}"><ele>${(p.elev_ft*0.3048).toFixed(1)}</ele><name>${esc(nameOf(p))}</name>`+
+       `<cmt>elev ${p.elev_ft} ft, prom ${p.prom_ft} ft${p.front?', first row':''}${p.done?', done':''}</cmt><sym>Summit</sym></wpt>\n`;});
+  download('i90_peaks.gpx',g+'</gpx>\n','application/gpx+xml');
 }
-document.getElementById('prom').addEventListener('input',e=>{
-  document.getElementById('pval').textContent=e.target.value;render();});
-document.querySelectorAll('.cls').forEach(c=>c.addEventListener('change',render));
-document.getElementById('lines').addEventListener('change',render);
 render();
 
-function download(name,text,mime){
-  const a=document.createElement('a');
-  a.href='data:'+mime+';charset=utf-8,'+encodeURIComponent(text);a.download=name;a.click();
+// ---- deep links from the analysis page: #route=ID or #track=ID
+function focusFromHash(){
+  const m=location.hash.match(/^#(route|track)=(\d+)$/); if(!m) return;
+  const layer=m[1]==='route'?routeLayer:trackLayer;
+  // track ids are the analysis page's; once live state replaces the layer, match on the run key
+  const want=m[1]==='route'?f=>String(f.properties.route_id)===m[2]:
+    f=>String(f.properties.id)===m[2]||f.properties.key===D.tracks.features.find(t=>String(t.properties.id)===m[2])?.properties.key;
+  layer.eachLayer(l=>{
+    const hit=want(l.feature);
+    l.setStyle({weight:hit?6:3,opacity:hit?1:.35});
+    if(hit){map.flyToBounds(l.getBounds().pad(.25),{duration:.8});l.openPopup?.();}
+  });
 }
-function dl(kind){
-  const vis=visiblePeaks();
-  if(kind==='geojson'){download('i90_peaks.geojson',
-    JSON.stringify({type:'FeatureCollection',features:vis}),'application/json');return;}
-  let g='<?xml version="1.0" encoding="UTF-8"?>\n'+
-    '<gpx version="1.1" creator="i90peaks" xmlns="http://www.topografix.com/GPX/1/1">\n';
-  vis.forEach(f=>{const p=f.properties,c=f.geometry.coordinates;
-    const nm=(p.name||(p.elev_ft+'ft pk (P'+p.prom_ft+')')).replace(/&/g,'&amp;').replace(/</g,'&lt;');
-    g+=`  <wpt lat="${c[1]}" lon="${c[0]}"><ele>${(p.elev_ft*0.3048).toFixed(1)}</ele>`+
-       `<name>${nm}</name><cmt>elev ${p.elev_ft} ft, prom ${p.prom_ft} ft, ${p.cls}</cmt>`+
-       `<sym>Summit</sym></wpt>\n`;});
-  g+='</gpx>\n';
-  download('i90_peaks.gpx',g,'application/gpx+xml');
-}
+addEventListener('hashchange',focusFromHash); focusFromHash();
+__LIVE_JS__
 </script></body></html>
+"""
+
+# Live layer: everything that needs theblacks.ai (state, uploads, saving). The
+# route tool itself also works offline except for saving.
+_LIVE_JS = r"""
+// ================= live state (when served from theblacks.ai) =================
+const $=id=>document.getElementById(id);
+const fmtDate=s=>s?new Date(String(s).slice(0,10)+'T12:00:00').toLocaleDateString('en-US',{month:'short',day:'numeric',year:'numeric'}):'';
+async function api(path,opt={}){
+  const r=await fetch(API+path,{credentials:'same-origin',cache:'no-store',...opt,
+    headers:{'content-type':'application/json'},body:opt.body&&JSON.stringify(opt.body)});
+  const j=await r.json().catch(()=>({}));
+  if(!r.ok) throw new Error(j.error||r.statusText);
+  return j;
+}
+async function loadState(){
+  try{STATE=await api('/state');}catch(e){return;}   // opened as a file: keep the built-in data
+  const by={};
+  STATE.summits.forEach(x=>(by[x.peak_id]??=[]).push(x));
+  P.forEach(f=>{const p=f.properties,ss=by[p.id]||[];
+    p.done=p.front&&ss.length>0;
+    p.done_by=[...new Set(ss.map(x=>fmtDate(x.summit_date)+(x.how==='manual'?' (marked by hand)':'')))];});
+  trackLayer.clearLayers();
+  trackLayer.addData({type:'FeatureCollection',features:STATE.tracks.map(t=>({type:'Feature',geometry:t.geometry,
+    properties:{uuid:t.id,key:t.key,source:t.source,name:t.name,date:fmtDate(t.run_date),dist_mi:t.dist_mi,gain_ft:t.gain_ft}}))});
+  drawnLayer.clearLayers();
+  drawnLayer.addData({type:'FeatureCollection',features:STATE.drawn.map(({geometry,...d})=>({type:'Feature',geometry,properties:d}))});
+  updateStats(); render(); focusFromHash();
+  if(selected!=null&&$('card').style.display==='block') select(selected,false);
+  if($('uploadPanel').style.display==='block') renderUpload();
+}
+async function signIn(after){
+  const pw=$('pw')?.value; if(!pw) return;
+  try{await api('/login',{method:'POST',body:{password:pw}});}catch(e){note(e.message,true);return;}
+  STATE.owner=true; renderUpload(); after?.();
+}
+function note(t,err,id){const el=$(id||(drawing?'dMsg':'upMsg')); if(el){el.textContent=t;el.className='msg'+(err?' err':'');}}
+const pwBox=(after)=>`<div class="row"><input type="password" class="field" id="pw" placeholder="Owner password" style="flex:1"
+  onkeydown="if(event.key==='Enter')signIn(${after||''})"><button class="btn primary" onclick="signIn(${after||''})">Sign in</button></div>`;
+
+// ---- hand-marked summits, run deletion
+async function markPeak(id){
+  try{await api('/summits',{method:'POST',body:{peak_id:id,summit_date:$('mDate')?.value||null}});}catch(e){alert(e.message);return;}
+  await loadState();
+}
+async function unmarkPeak(id){
+  try{await api('/summits?peak_id='+id,{method:'DELETE'});}catch(e){alert(e.message);return;}
+  await loadState();
+}
+async function deleteRun(uuid){
+  if(!confirm('Delete this run and the summits it checked off?')) return;
+  try{await api('/runs?id='+uuid,{method:'DELETE'});}catch(e){alert(e.message);return;}
+  map.closePopup(); await loadState();
+}
+
+// ================= upload CalTopo GeoJSON =================
+function hidePanels(){$('card').style.display='none';$('uploadPanel').style.display='none';preview.clearLayers();}
+const preview=L.layerGroup().addTo(map);
+let pending=[];
+$('addRunsBtn').onclick=()=>{if(drawing) stopDraw(); hidePanels(); $('uploadPanel').style.display='block'; renderUpload();};
+function closeUpload(){$('uploadPanel').style.display='none';preview.clearLayers();pending=[];}
+function renderUpload(){
+  if(!STATE){$('upAuth').innerHTML='<p class="msg err">Uploading works on theblacks.ai/i90peaks.</p>';$('upBody').innerHTML='';return;}
+  if(!STATE.owner){$('upAuth').innerHTML=pwBox()+'<div class="msg" id="upMsg"></div>';$('upBody').innerHTML='';return;}
+  $('upAuth').innerHTML='';
+  $('upBody').innerHTML=`<div class="drop" id="drop">Drop CalTopo <b>.json / .geojson</b> here, or click to choose</div>
+    <input type="file" id="file" accept=".json,.geojson,application/geo+json,application/json" multiple hidden>
+    <div class="runs" id="runs"></div><div class="row" id="upActions"></div><div class="msg" id="upMsg"></div>`;
+  const drop=$('drop'),file=$('file');
+  drop.onclick=()=>file.click();
+  file.onchange=()=>readFiles(file.files);
+  drop.ondragover=e=>{e.preventDefault();drop.classList.add('over');};
+  drop.ondragleave=()=>drop.classList.remove('over');
+  drop.ondrop=e=>{e.preventDefault();drop.classList.remove('over');readFiles(e.dataTransfer.files);};
+  renderRuns();
+}
+function linesOf(gj,fallbackName){
+  const out=[];
+  const visit=(g,name)=>{if(!g) return;
+    if(g.type==='LineString') out.push({name,lines:[g.coordinates]});
+    else if(g.type==='MultiLineString') out.push({name,lines:g.coordinates});
+    else if(g.type==='GeometryCollection') g.geometries.forEach(x=>visit(x,name));};
+  if(gj.type==='FeatureCollection') gj.features.forEach((f,i)=>visit(f.geometry,f.properties?.title||f.properties?.name||`${fallbackName} ${i+1}`));
+  else if(gj.type==='Feature') visit(gj.geometry,gj.properties?.title||gj.properties?.name||fallbackName);
+  else visit(gj,fallbackName);
+  return out;
+}
+const mOf=(a,b)=>map.distance([a[1],a[0]],[b[1],b[0]]);
+function thinLine(l,step=5){const o=[l[0]];for(let i=1;i<l.length-1;i++) if(mOf(o[o.length-1],l[i])>=step) o.push(l[i]);o.push(l[l.length-1]);return o;}
+async function readFiles(files){
+  for(const f of files){
+    let gj; try{gj=JSON.parse(await f.text());}catch(e){note(`${f.name}: not JSON`,true);continue;}
+    for(const r of linesOf(gj,f.name.replace(/\.(geo)?json$/i,''))){
+      const lines=r.lines.filter(l=>l.length>1).map(l=>thinLine(l));
+      if(!lines.length) continue;
+      const t=lines[0][0][3], hasT=t>1e11, hasZ=lines.every(l=>l.filter(c=>c.length>2&&Number.isFinite(c[2])).length>=l.length*.8);
+      let dist=0; lines.forEach(l=>{for(let i=1;i<l.length;i++) dist+=mOf(l[i-1],l[i]);});
+      pending.push({name:r.name,date:hasT?new Date(t).toISOString().slice(0,10):new Date().toISOString().slice(0,10),
+        hasT,hasZ,lines,dist_mi:dist/1609.344,gain_ft:null,on:true,peaks:null});
+    }
+  }
+  if(!pending.length){note('No lines found. Export the track from CalTopo as GeoJSON.',true);return;}
+  preview.clearLayers();
+  const b=L.latLngBounds([]);
+  pending.forEach(r=>r.lines.forEach(l=>{const pl=L.polyline(l.map(c=>[c[1],c[0]]),{color:css('--drawn'),weight:3,dashArray:'5 5'}).addTo(preview);b.extend(pl.getBounds());}));
+  map.flyToBounds(b.pad(.2),{duration:.6});
+  // climb from the DEM when the export has no elevations
+  for(const r of pending.filter(r=>!r.hasZ&&r.gain_ft==null)){
+    const ll=r.lines.flatMap(l=>densify(l.map(c=>L.latLng(c[1],c[0])),30));
+    r.gain_ft=climb(await Promise.all(ll.map(p=>elevAt(p.lat,p.lng))))[0]/0.3048;
+  }
+  renderRuns(); checkRuns();
+}
+const payload=r=>({name:r.name,date:r.date,lines:r.lines,gain_ft:r.gain_ft});
+async function checkRuns(){
+  note('Checking summits…');
+  try{const j=await api('/runs',{method:'POST',body:{dry_run:true,runs:pending.map(payload)}});
+    j.results.forEach((x,i)=>{pending[i].peaks=x.peak_names||[];pending[i].on=(x.peak_names||[]).length>0;if(x.gain_ft!=null)pending[i].gain_ft=x.gain_ft;});
+    note('');}catch(e){note(e.message,true);}
+  renderRuns();
+}
+function renderRuns(){
+  const box=$('runs'); if(!box) return;
+  box.innerHTML=pending.map((r,i)=>`<div class="run"><input type="checkbox" ${r.on?'checked':''} onchange="pending[${i}].on=this.checked;renderRuns()">
+    <input type="text" value="${esc(r.name)}" onchange="pending[${i}].name=this.value">
+    <div class="meta">${r.hasT?esc(fmtDate(r.date)):`<input type="date" value="${r.date}" onchange="pending[${i}].date=this.value">`}
+      · ${r.dist_mi.toFixed(1)} mi${r.gain_ft!=null?` · ${fmt(Math.round(r.gain_ft))} ft`:''}</div>
+    <div class="meta">${r.peaks==null?'checking…':r.peaks.length?r.peaks.map(n=>`<span class="chip done">▲ ${esc(n)}</span>`).join(''):
+      'No first-row summit on this line, so it is left out unless you tick it.'}</div></div>`).join('');
+  const n=pending.filter(r=>r.on).length;
+  $('upActions').innerHTML=pending.length?`<button class="btn" onclick="pending=[];preview.clearLayers();renderRuns()">Clear</button><span style="flex:1"></span>
+    <button class="btn primary" ${n?'':'disabled'} onclick="uploadRuns()">Upload ${n} run${n===1?'':'s'}</button>`:'';
+}
+async function uploadRuns(){
+  const sel=pending.filter(r=>r.on);
+  note('Uploading…');
+  let j; try{j=await api('/runs',{method:'POST',body:{runs:sel.map(payload)}});}catch(e){note(e.message,true);return;}
+  const before=new Set(P.filter(f=>f.properties.done).map(f=>f.properties.id));
+  pending=[];preview.clearLayers();
+  await loadState();
+  const fresh=P.filter(f=>f.properties.done&&!before.has(f.properties.id)).map(f=>nameOf(f.properties));
+  const errs=j.results.filter(x=>x.error).map(x=>`${x.name}: ${x.error}`);
+  renderRuns();
+  note(`Uploaded ${j.results.length-errs.length} run(s).`+(fresh.length?` New summits: ${fresh.join(', ')}.`:' No new summits.')+(errs.length?' '+errs.join('; '):''),errs.length>0);
+}
+
+// ================= route tool (CalTopo-style line drawing) =================
+let drawing=false,pts=[],hist=[],editId=null,dLine=null,lastStats=null,statSeq=0,statTimer=null;
+const dLayer=L.layerGroup().addTo(map), hoverDot=L.circleMarker([0,0],{radius:6,color:'#fff',weight:2,fillOpacity:1,interactive:false});
+$('drawBtn').onclick=()=>drawing?stopDraw():startDraw();
+function startDraw(o={}){
+  hidePanels(); drawing=true; document.body.classList.add('drawing'); map.doubleClickZoom.disable();
+  pts=(o.pts||[]).map(p=>L.latLng(p.lat,p.lng)); hist=[]; editId=o.id||null;
+  $('dName').value=o.name||''; $('dNotes').value=o.notes||''; $('dOff').checked=!!o.off; note('',false,'dMsg');
+  $('drawPanel').style.display='block'; $('drawBtn').classList.add('on'); map.invalidateSize(); redraw();
+  if(pts.length>1) map.flyToBounds(L.latLngBounds(pts).pad(.3),{duration:.6});
+}
+function stopDraw(){
+  drawing=false; document.body.classList.remove('drawing'); map.doubleClickZoom.enable();
+  dLayer.clearLayers(); map.removeLayer(hoverDot); $('drawPanel').style.display='none'; $('drawBtn').classList.remove('on');
+  map.invalidateSize();
+}
+map.on('click',e=>{if(!drawing) return; push(); pts.push(snap(e.latlng)); redraw();});
+map.on('popupopen',()=>{if(drawing) map.closePopup();});
+function push(){hist.push(pts.map(p=>L.latLng(p.lat,p.lng))); if(hist.length>200) hist.shift();}
+function undo(){if(hist.length){pts=hist.pop();redraw();}}
+function clearRoute(){if(pts.length){push();pts=[];redraw();}}
+function reverseRoute(){push();pts.reverse();redraw();}
+addEventListener('keydown',e=>{if(drawing&&(e.ctrlKey||e.metaKey)&&e.key.toLowerCase()==='z'&&!/INPUT|TEXTAREA/.test(document.activeElement.tagName)){e.preventDefault();undo();}});
+function snap(ll){
+  if(!$('dSnap').checked) return ll;
+  const at=map.latLngToContainerPoint(ll); let best=ll,bd=14;
+  P.forEach(f=>{if(!f.properties.front) return; const c=f.geometry.coordinates,q=map.latLngToContainerPoint([c[1],c[0]]),d=q.distanceTo(at);
+    if(d<bd){bd=d;best=L.latLng(c[1],c[0]);}});
+  return best;
+}
+const icon=(cls,s)=>L.divIcon({className:'',html:`<div class="${cls}"></div>`,iconSize:[s,s],iconAnchor:[s/2,s/2]});
+function redraw(){
+  dLayer.clearLayers();
+  dLine=L.polyline(pts,{color:css('--drawn'),weight:4,opacity:.95,interactive:false}).addTo(dLayer);
+  pts.forEach((p,i)=>{
+    const m=L.marker(p,{draggable:true,icon:icon('vtx'+(i===0||i===pts.length-1?' end':''),12)}).addTo(dLayer);
+    m.on('dragstart',push); m.on('drag',e=>{pts[i]=e.target.getLatLng();dLine.setLatLngs(pts);});
+    m.on('dragend',e=>{pts[i]=snap(e.target.getLatLng());redraw();});
+    const del=e=>{L.DomEvent.stop(e);push();pts.splice(i,1);redraw();};
+    m.on('dblclick',del); m.on('contextmenu',del);
+  });
+  for(let i=1;i<pts.length;i++){
+    const a=pts[i-1],b=pts[i];
+    const m=L.marker([(a.lat+b.lat)/2,(a.lng+b.lng)/2],{draggable:true,icon:icon('mid',10)}).addTo(dLayer);
+    m.on('dragstart',()=>{push();pts.splice(i,0,m.getLatLng());});
+    m.on('drag',e=>{pts[i]=e.target.getLatLng();dLine.setLatLngs(pts);});
+    m.on('dragend',e=>{pts[i]=snap(e.target.getLatLng());redraw();});
+  }
+  clearTimeout(statTimer); statTimer=setTimeout(computeStats,150);
+}
+function densify(ll,step){
+  const out=[];
+  for(let i=0;i<ll.length;i++){
+    if(i===0){out.push(ll[0]);continue;}
+    const a=ll[i-1],b=ll[i],n=Math.max(1,Math.ceil(map.distance(a,b)/step));
+    for(let k=1;k<=n;k++) out.push(L.latLng(a.lat+(b.lat-a.lat)*k/n,a.lng+(b.lng-a.lng)*k/n));
+  }
+  return out;
+}
+// elevation from AWS terrain tiles (terrarium PNG, z13 ~ 13 m at this latitude)
+const DEMZ=13,TILE=new Map();
+function tileXY(lat,lng){const n=2**DEMZ,r=lat*Math.PI/180;
+  return [(lng+180)/360*n,(1-Math.log(Math.tan(r)+1/Math.cos(r))/Math.PI)/2*n];}
+function loadTile(tx,ty){
+  const k=tx+'/'+ty;
+  if(!TILE.has(k)) TILE.set(k,new Promise(res=>{const img=new Image();img.crossOrigin='anonymous';
+    img.onload=()=>{const c=document.createElement('canvas');c.width=c.height=256;const g=c.getContext('2d',{willReadFrequently:true});
+      g.drawImage(img,0,0);res(g.getImageData(0,0,256,256).data);};
+    img.onerror=()=>res(null);
+    img.src=`https://s3.amazonaws.com/elevation-tiles-prod/terrarium/${DEMZ}/${tx}/${ty}.png`;}));
+  return TILE.get(k);
+}
+async function elevAt(lat,lng){
+  const [x,y]=tileXY(lat,lng),tx=Math.floor(x),ty=Math.floor(y),d=await loadTile(tx,ty);
+  if(!d) return null;
+  const i=(Math.min(255,Math.floor((y-ty)*256))*256+Math.min(255,Math.floor((x-tx)*256)))*4;
+  return d[i]*256+d[i+1]+d[i+2]/256-32768;
+}
+function climb(z){   // [gain_m, loss_m] after a 3-point smooth
+  const v=z.map((_,i)=>{const w=z.slice(Math.max(0,i-1),i+2).filter(x=>x!=null);return w.length?w.reduce((a,b)=>a+b)/w.length:null;});
+  let g=0,l=0; for(let i=1;i<v.length;i++) if(v[i]!=null&&v[i-1]!=null){const d=v[i]-v[i-1]; if(d>0) g+=d; else l-=d;}
+  return [g,l];
+}
+function paceAt(grade){   // seconds per metre on trail, from the athlete's own runs
+  const c=D.pace.centers,b=D.pace.base;
+  if(grade<=c[0]) return b[0]; if(grade>=c[c.length-1]) return b[b.length-1];
+  let k=1; while(c[k]<grade) k++;
+  return b[k-1]+(b[k]-b[k-1])*(grade-c[k-1])/(c[k]-c[k-1]);
+}
+async function computeStats(){
+  const seq=++statSeq;
+  if(pts.length<2){lastStats=null;['dDist','dGain','dLoss'].forEach(k=>$(k).textContent='0');$('dTime').textContent='–';
+    $('dProfile').innerHTML='';$('dPeaks').innerHTML='';return;}
+  const dense=densify(pts,30), z=await Promise.all(dense.map(p=>elevAt(p.lat,p.lng)));
+  if(seq!==statSeq) return;
+  const cum=[0]; for(let i=1;i<dense.length;i++) cum.push(cum[i-1]+map.distance(dense[i-1],dense[i]));
+  const [gain,loss]=climb(z), dist=cum[cum.length-1];
+  let secs=null;
+  if(D.pace){secs=0;for(let i=1;i<dense.length;i++){const h=cum[i]-cum[i-1];
+    secs+=h*paceAt(z[i]!=null&&z[i-1]!=null&&h>0?(z[i]-z[i-1])/h:0);}
+    if($('dOff').checked) secs*=D.pace.off;}
+  const near=P.filter(f=>f.properties.front&&dense.some(p=>map.distance(p,[f.geometry.coordinates[1],f.geometry.coordinates[0]])<60));
+  lastStats={dense,z,cum,dist,gain,loss,secs,peaks:near.map(f=>f.properties.id)};
+  $('dDist').textContent=(dist/1609.344).toFixed(1);
+  $('dGain').textContent=fmt(Math.round(gain/0.3048)); $('dLoss').textContent=fmt(Math.round(loss/0.3048));
+  $('dTime').textContent=secs==null?'–':(secs/3600).toFixed(1);
+  $('dPeaks').innerHTML=near.map(f=>`<span class="chip${f.properties.done?' done':''}">▲ ${esc(nameOf(f.properties))}</span>`).join('');
+  drawProfile();
+}
+function drawProfile(){
+  const s=lastStats,W=340,H=110,px=4,py=12;
+  const vals=s.z.filter(v=>v!=null); if(vals.length<2){$('dProfile').innerHTML='';return;}
+  const mn=Math.min(...vals),mx=Math.max(...vals),span=Math.max(1,mx-mn);
+  const X=d=>px+(W-2*px)*d/Math.max(1,s.dist), Y=v=>H-py-(H-2*py)*(v-mn)/span;
+  const line=s.z.map((v,i)=>v==null?null:X(s.cum[i]).toFixed(1)+','+Y(v).toFixed(1)).filter(Boolean);
+  const col=css('--drawn');
+  $('dProfile').innerHTML=`<svg id="dSvg" viewBox="0 0 ${W} ${H}" width="100%" style="display:block;margin-top:8px;touch-action:none">
+    <path d="M${X(0)},${H} L${line.join(' L')} L${X(s.dist)},${H} Z" fill="${col}" opacity=".14"/>
+    <polyline points="${line.join(' ')}" fill="none" stroke="${col}" stroke-width="2"/>
+    <text x="${W-px}" y="10" text-anchor="end" font-size="10" fill="${css('--muted')}">${fmt(Math.round(mx/0.3048))} ft</text>
+    <text x="${W-px}" y="${H-2}" text-anchor="end" font-size="10" fill="${css('--muted')}">${fmt(Math.round(mn/0.3048))} ft</text>
+    <line id="dCross" y1="0" y2="${H}" stroke="${css('--muted')}" stroke-dasharray="2 3" visibility="hidden"/>
+    <text id="dTip" y="10" font-size="10.5" font-weight="600" fill="${css('--ink')}"></text></svg>`;
+  const svg=$('dSvg');
+  const move=e=>{const r=svg.getBoundingClientRect(),d=Math.max(0,Math.min(1,((e.clientX-r.left)/r.width*W-px)/(W-2*px)))*s.dist;
+    let i=0; while(i<s.cum.length-1&&s.cum[i]<d) i++;
+    const x=X(s.cum[i]); $('dCross').setAttribute('x1',x); $('dCross').setAttribute('x2',x); $('dCross').setAttribute('visibility','visible');
+    const t=$('dTip'); t.textContent=`${(s.cum[i]/1609.344).toFixed(2)} mi · ${s.z[i]==null?'–':fmt(Math.round(s.z[i]/0.3048))} ft`;
+    t.setAttribute('x',x>W/2?x-6:x+6); t.setAttribute('text-anchor',x>W/2?'end':'start');
+    hoverDot.setLatLng(s.dense[i]).setStyle({fillColor:col}).addTo(map);};
+  svg.onpointermove=move; svg.onpointerdown=move;
+  svg.onpointerleave=()=>{$('dCross').setAttribute('visibility','hidden');$('dTip').textContent='';map.removeLayer(hoverDot);};
+}
+const autoName=()=>lastStats?.peaks.length?lastStats.peaks.map(i=>nameOf(P[i].properties)).join(' → '):'Drawn route';
+async function saveDrawn(){
+  if(pts.length<2){note('Draw at least two points.',true,'dMsg');return;}
+  if(!STATE){note('Saving works on theblacks.ai/i90peaks. Use GPX to keep it.',true,'dMsg');return;}
+  if(!STATE.owner){$('dMsg').innerHTML=pwBox('saveDrawn')+'<div class="msg" id="dErr"></div>';return;}
+  if(statTimer){clearTimeout(statTimer);await computeStats();}
+  const s=lastStats;
+  try{const j=await api('/drawn',{method:'POST',body:{id:editId,name:$('dName').value.trim()||autoName(),
+      peaks:s?.peaks||[],coordinates:pts.map(p=>[p.lng,p.lat]),notes:$('dNotes').value.trim(),
+      dist_mi:s&&+(s.dist/1609.344).toFixed(2),gain_ft:s&&Math.round(s.gain/0.3048),est_hours:s?.secs!=null?+(s.secs/3600).toFixed(1):null}});
+    editId=j.id; if(!$('dName').value.trim()) $('dName').value=autoName();
+    note('Saved ✓',false,'dMsg'); loadState();}
+  catch(e){note(e.message,true,'dMsg');}
+}
+function gpx(name,ll,z){
+  const e=s=>s.replace(/&/g,'&amp;').replace(/</g,'&lt;');
+  return `<?xml version="1.0" encoding="UTF-8"?>\n<gpx version="1.1" creator="i90peaks" xmlns="http://www.topografix.com/GPX/1/1">\n<trk><name>${e(name)}</name><trkseg>`+
+    ll.map((p,i)=>`<trkpt lat="${p.lat.toFixed(6)}" lon="${p.lng.toFixed(6)}">${z&&z[i]!=null?`<ele>${z[i].toFixed(1)}</ele>`:''}</trkpt>`).join('')+'</trkseg></trk>\n</gpx>\n';
+}
+const slug=s=>s.replace(/[^\w]+/g,'_').replace(/^_|_$/g,'').slice(0,60)||'route';
+function exportDrawn(){
+  if(pts.length<2) return;
+  const name=$('dName').value.trim()||autoName();
+  download(slug(name)+'.gpx',gpx(name,lastStats?lastStats.dense:pts,lastStats?.z),'application/gpx+xml');
+}
+function gpxOfDrawn(id){const d=STATE.drawn.find(x=>x.id===id); if(!d) return;
+  download(slug(d.name)+'.gpx',gpx(d.name,d.geometry.coordinates.map(c=>L.latLng(c[1],c[0]))),'application/gpx+xml');}
+async function deleteDrawn(id){
+  if(!confirm('Delete this drawn route?')) return;
+  try{await api('/drawn?id='+id,{method:'DELETE'});}catch(e){alert(e.message);return;}
+  map.closePopup(); loadState();
+}
+function editDrawn(id){const d=STATE.drawn.find(x=>x.id===id); if(!d) return; map.closePopup();
+  startDraw({id:STATE.owner?d.id:null,name:d.name,notes:d.notes,pts:d.geometry.coordinates.map(c=>L.latLng(c[1],c[0]))});}
+function simplify(ll,tol){   // Douglas-Peucker in metres, so a dense route stays editable
+  if(ll.length<3) return ll;
+  const xy=ll.map(p=>map.options.crs.project(p)), keep=new Array(ll.length).fill(false); keep[0]=keep[ll.length-1]=true;
+  const k=1/Math.cos(ll[0].lat*Math.PI/180), st=[[0,ll.length-1]];
+  while(st.length){const [a,b]=st.pop(); let md=0,mi=-1;
+    for(let i=a+1;i<b;i++){const d=L.LineUtil.pointToSegmentDistance(xy[i],xy[a],xy[b])/k; if(d>md){md=d;mi=i;}}
+    if(md>tol){keep[mi]=true;st.push([a,mi],[mi,b]);}}
+  return ll.filter((_,i)=>keep[i]);
+}
+function editPlanned(rid){const f=D.routes.features.find(x=>x.properties.route_id===rid); if(!f) return; map.closePopup();
+  startDraw({name:f.properties.name,notes:f.properties.desc,off:f.properties.off_trail_pct>50,
+    pts:simplify(f.geometry.coordinates.map(c=>L.latLng(c[1],c[0])),12)});}
+function drawTo(id){const c=P[id].geometry.coordinates; startDraw({name:nameOf(P[id].properties)}); map.flyTo([c[1],c[0]],14,{duration:.6});}
+
+loadState();
 """
