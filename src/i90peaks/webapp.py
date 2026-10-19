@@ -255,7 +255,7 @@ input[type=search]{width:100%;border:1px solid var(--line);background:var(--pane
       <label><input type="checkbox" id="t_tracks" checked> my tracks</label>
       <label><input type="checkbox" id="t_routes" checked> planned routes</label>
       <label><input type="checkbox" id="t_drawn" checked> drawn routes</label>
-      <label title="the ground each peak rises above its key col, coloured by prominence"><input type="checkbox" id="t_prom"> prominence islands</label>
+      <label title="the ground each peak rises above its key col, coloured by prominence"><input type="checkbox" id="t_prom" checked> prominence islands</label>
     </div>
   </div>
   <div id="list"></div>
@@ -442,6 +442,7 @@ if(D.prom){
   const hover=e=>{if(!t.checked||(typeof drawing!=='undefined'&&drawing))return;
     const id=promAt(e.latlng);if(id!==last){last=id;promInfo(id);}};
   map.on('mousemove',hover);map.on('click',hover);
+  if(t.checked) t.dispatchEvent(new Event('change'));   // on by default
 }else document.getElementById('t_prom').parentElement.style.display='none';
 
 // ---- detail card
