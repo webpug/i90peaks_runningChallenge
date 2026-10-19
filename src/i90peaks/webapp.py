@@ -251,11 +251,11 @@ input[type=search]{width:100%;border:1px solid var(--line);background:var(--pane
     <div class="range">Prominence ≥ <b id="pval">250</b> ft
       <input id="prom" type="range" min="250" max="3000" step="50" value="250"></div>
     <div class="toggles">
-      <label title="visible from zoom 11"><input type="checkbox" id="t_caps" checked> summit caps</label>
-      <label><input type="checkbox" id="t_tracks" checked> my tracks</label>
-      <label><input type="checkbox" id="t_routes" checked> planned routes</label>
-      <label><input type="checkbox" id="t_drawn" checked> drawn routes</label>
-      <label title="the ground each peak rises above its key col, coloured by prominence"><input type="checkbox" id="t_prom" checked> prominence islands</label>
+      <label title="visible from zoom 11"><input type="checkbox" autocomplete="off" id="t_caps" checked> summit caps</label>
+      <label><input type="checkbox" autocomplete="off" id="t_tracks" checked> my tracks</label>
+      <label><input type="checkbox" autocomplete="off" id="t_routes" checked> planned routes</label>
+      <label><input type="checkbox" autocomplete="off" id="t_drawn" checked> drawn routes</label>
+      <label title="the ground each peak rises above its key col, coloured by prominence"><input type="checkbox" autocomplete="off" id="t_prom" checked> prominence islands</label>
     </div>
   </div>
   <div id="list"></div>
