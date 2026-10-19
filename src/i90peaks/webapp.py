@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import json
 
-from . import config
+from . import config, promraster
 
 
 def _clean_name(v) -> str:
@@ -76,6 +76,7 @@ def build_app(classified, highway, details=None, caps=None, tracks=None, routes=
         "routes": routes or {"type": "FeatureCollection", "features": []},
         "links": links or [],
         "pace": pace,
+        "prom": promraster.load_meta(),     # prominence-island raster, if built
     }
     html = (_TEMPLATE.replace("__LIVE_JS__", _LIVE_JS)
             .replace("__DATA__", json.dumps(data, separators=(",", ":"))))
@@ -202,6 +203,14 @@ input[type=search]{width:100%;border:1px solid var(--line);background:var(--pane
 .mid:hover{opacity:.9}
 .drawing #map{cursor:crosshair}
 .kbd{font-size:11px;color:var(--muted)}
+#promInfo{position:absolute;left:56px;bottom:24px;z-index:500;display:none;max-width:290px;background:var(--panel);
+  border:1px solid var(--line);border-radius:12px;padding:8px 10px;box-shadow:var(--shadow);font-size:11.5px;color:var(--muted)}
+#promInfo b{color:var(--ink)}
+#promInfo .ramp{display:flex;margin:6px 0 2px;border-radius:4px;overflow:hidden}
+#promInfo .ramp i{flex:1;height:8px}
+#promInfo .ticks{display:flex;font-size:10px}
+#promInfo .ticks span{flex:1}
+#promInfo input{width:100%;margin:6px 0 0}
 @media (max-width:820px){
   .app{grid-template-columns:1fr;grid-template-rows:52vh 1fr}
   aside{order:2;border-right:0;border-top:1px solid var(--line)}
@@ -246,6 +255,7 @@ input[type=search]{width:100%;border:1px solid var(--line);background:var(--pane
       <label><input type="checkbox" id="t_tracks" checked> my tracks</label>
       <label><input type="checkbox" id="t_routes" checked> planned routes</label>
       <label><input type="checkbox" id="t_drawn" checked> drawn routes</label>
+      <label title="the ground each peak rises above its key col, coloured by prominence"><input type="checkbox" id="t_prom"> prominence islands</label>
     </div>
   </div>
   <div id="list"></div>
@@ -256,6 +266,7 @@ input[type=search]{width:100%;border:1px solid var(--line);background:var(--pane
 <div style="position:relative;min-height:0">
   <div id="map"></div>
   <div id="card"><button class="x" onclick="closeCard()">×</button><div id="cardBody"></div></div>
+  <div id="promInfo"></div>
   <div class="panel" id="uploadPanel"><button class="x" onclick="closeUpload()">×</button>
     <div class="eyebrow">CalTopo → map</div><h2>Add runs</h2>
     <p>Export a track from CalTopo (Export → GeoJSON) and drop it here. Each line becomes a run; any first-row
@@ -379,6 +390,59 @@ const tog=(id,layer)=>document.getElementById(id).addEventListener('change',e=>e
 const capsOn=()=>document.getElementById('t_caps').checked&&map.getZoom()>=11;
 const syncCaps=()=>capsOn()?capLayer.addTo(map):map.removeLayer(capLayer);
 map.on('zoomend',syncCaps);document.getElementById('t_caps').addEventListener('change',syncCaps);syncCaps();tog('t_tracks',trackLayer);tog('t_routes',routeLayer);tog('t_drawn',drawnLayer);
+
+// ---- prominence islands: an index PNG (pixel RGB = peak id + 1, see promraster.py),
+// coloured here by prominence and read back on hover to name the peak that owns the ground
+const PROM_STOPS=[250,400,600,1000,2000,4000];
+const PROM_COLS=['#fcfdbf','#feb078','#f1605d','#b63679','#721f81','#2c115f'];
+const promCol=v=>{let k=0;while(k<PROM_STOPS.length-1&&v>=PROM_STOPS[k+1])k++;return PROM_COLS[k];};
+let promLayer=null,promIdx=null,promOpacity=.6;
+map.createPane('prom').style.zIndex=350;          // under the routes and markers
+async function loadProm(){
+  const img=new Image();
+  img.src=/\.html$/.test(location.pathname)?'prominence.png':'/i90peaks/prominence.png';
+  await img.decode();
+  const [w,h]=[img.width,img.height],cv=document.createElement('canvas');cv.width=w;cv.height=h;
+  const cx=cv.getContext('2d',{willReadFrequently:true});cx.drawImage(img,0,0);
+  const px=cx.getImageData(0,0,w,h),d=px.data;promIdx=new Int32Array(w*h);
+  const lut=P.map(f=>{const c=promCol(f.properties.prom_ft);return [1,3,5].map(i=>parseInt(c.slice(i,i+2),16));});
+  for(let i=0,j=0;i<promIdx.length;i++,j+=4){
+    const id=(d[j]<<16|d[j+1]<<8|d[j+2])-1;promIdx[i]=id;
+    if(id<0){d[j+3]=0;continue;}
+    const c=lut[id]||[128,128,128];d[j]=c[0];d[j+1]=c[1];d[j+2]=c[2];d[j+3]=255;}
+  cx.putImageData(px,0,0);
+  const url=URL.createObjectURL(await new Promise(r=>cv.toBlob(r)));
+  promLayer=L.imageOverlay(url,D.prom.bounds,{pane:'prom',opacity:promOpacity,interactive:false});
+}
+function promAt(ll){
+  if(!promIdx) return -1;
+  const [[s,w],[n,e]]=D.prom.bounds,[W,H]=D.prom.size,pr=ll=>L.CRS.EPSG3857.project(ll);
+  const a=pr(L.latLng(s,w)),b=pr(L.latLng(n,e)),p=pr(ll);
+  const x=Math.floor((p.x-a.x)/(b.x-a.x)*W),y=Math.floor((b.y-p.y)/(b.y-a.y)*H);
+  return x<0||y<0||x>=W||y>=H?-1:promIdx[y*W+x];
+}
+function promInfo(id){
+  const box=document.getElementById('promInfo');
+  const ramp=`<div class="ramp">${PROM_COLS.map(c=>`<i style="background:${c}"></i>`).join('')}</div>`+
+    `<div class="ticks">${PROM_STOPS.map(v=>`<span>${fmt(v)}+</span>`).join('')}</div>`;
+  let head='Ground above each peak\'s key col, coloured by its prominence (ft). Hover or tap to see whose it is.';
+  if(id>=0){const p=P[id].properties;
+    head=`<b>${esc(p.name||'Unnamed peak')}</b>'s ground · ${fmt(p.prom_ft)} ft prominence`+
+      `${p.front?'':' · not first row'} · <a href="#" onclick="select(${id},true);return false">show</a>`;}
+  box.innerHTML=head+ramp+`<input type="range" min="15" max="100" value="${promOpacity*100}" oninput="promOpacity=this.value/100;promLayer.setOpacity(promOpacity)" aria-label="opacity">`;
+}
+if(D.prom){
+  const t=document.getElementById('t_prom'),box=document.getElementById('promInfo');
+  t.addEventListener('change',async()=>{
+    if(!t.checked){if(promLayer)map.removeLayer(promLayer);box.style.display='none';return;}
+    if(!promLayer){box.style.display='block';box.textContent='Loading prominence…';await loadProm();}
+    if(t.checked){promLayer.addTo(map);box.style.display='block';promInfo(-1);}
+  });
+  let last=-2;
+  const hover=e=>{if(!t.checked||(typeof drawing!=='undefined'&&drawing))return;
+    const id=promAt(e.latlng);if(id!==last){last=id;promInfo(id);}};
+  map.on('mousemove',hover);map.on('click',hover);
+}else document.getElementById('t_prom').parentElement.style.display='none';
 
 // ---- detail card
 function profileSVG(d){

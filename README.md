@@ -102,11 +102,15 @@ coordinates sent anywhere) into a 40 m corridor mosaic. Each route is sampled ev
 | `similarity.html` | AlphaEarth route similarity, planned routes, pace model |
 | `site_seed.json` | peaks + summit zones, published runs and summits for the site's Supabase tables |
 | `planned_routes.gpx` / `.geojson` | planned outings (CalTopo-ready) |
+| `prominence.png` / `.json` | the map's "prominence islands" layer: each cell assigned to the innermost island (ground above a peak's key col) containing it, stored as an index PNG (RGB = peak id + 1) that the map colours by prominence and reads back on hover (`promraster.py`) |
 | `i90_frontrow_peaks.gpx`, `i90_peaks.geojson`, `peaks_classified.gpkg`, `summit_caps.gpkg` | peak data |
 
-To publish, copy `i90_app.html`, `similarity.html`, `planned_routes.gpx` and
-`site_seed.json` into `webpug/theblacks.ai/content/i90peaks/`, run
+To publish, copy `i90_app.html`, `similarity.html`, `planned_routes.gpx`,
+`prominence.png` and `site_seed.json` into `webpug/theblacks.ai/content/i90peaks/`, run
 `railway run node scripts/i90peaks-import.mjs` there, and push (Railway deploys `main`).
+
+`scripts/home_background.py ../theblacks.ai/public/home` renders the theblacks.ai home
+page background (a dithered hillshade of the corridor and its prominence-island colouring).
 
 ## The map's route tool
 

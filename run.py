@@ -8,12 +8,12 @@ Steps:
   3. Cross-check against the Kirmse reference download.
   4. Fetch the I-90 centerline.
   5. Classify each peak as first-row vs behind (summit caps + straight approaches).
-  6. Write GeoPackage + interactive HTML map.
+  6. Write GeoPackage + interactive HTML map (+ the prominence-island raster).
 """
 import pickle
 
 from src.i90peaks import (config, dem, prominence, peaks as kirmse_mod, highway,
-                          adjacency, names, validate, viz, export, webapp)
+                          adjacency, names, validate, viz, export, webapp, promraster)
 
 
 def main():
@@ -45,6 +45,7 @@ def main():
     print(f"  wrote {config.RESULT_GPKG}, {config.CAPS_GPKG}")
 
     print("\n==[7/7] map + exports ==")
+    promraster.build(classified)
     viz.make_map(classified, hw)
     webapp.build_app(classified, hw, details=details, caps=caps)
     export.export_all(classified)
