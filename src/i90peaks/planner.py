@@ -32,6 +32,10 @@ from .embeddings import MOSAIC_TIF, Embeddings
 
 GRID_PKL = config.INTERIM / "plan_grid.npz"
 PACE_PKL = config.INTERIM / "pace_model.pkl"
+# fallback for peaks the normal search can't reach: a wider search window and a
+# scramble allowance this close to the summit
+FALLBACK_PAD = 400
+SCRAMBLE_M = 300.0
 GRADE_BINS = np.arange(-0.60, 0.61, 0.05)
 _TO_UTM = Transformer.from_crs("EPSG:4326", "EPSG:32610", always_xy=True)
 _FROM_UTM = Transformer.from_crs("EPSG:32610", "EPSG:4326", always_xy=True)
@@ -76,14 +80,14 @@ def _chunks(pts, prof_fn, chunk_m=100.0):
 def fit_pace(activities, overwrite=False):
     if PACE_PKL.exists() and not overwrite:
         return pickle.load(open(PACE_PKL, "rb"))
-    from .tracks import ON_FOOT
+    from .tracks import RUN_TYPES
     models = S.fit_models()
     E, D = Embeddings(), terrain.DEM()
     tree = pickle.load(open(config.INTERIM / "trails_kdtree.pkl", "rb"))
     w, s, e, n = config.BBOX
     rows = []
     for act in activities:
-        if act["type"] not in ON_FOOT or act["type"] in ("Backcountry Ski", "Snowshoe"):
+        if act["type"] not in RUN_TYPES:
             continue
         pts = np.asarray(act["pts"], dtype=float)
         if len(pts) < 20 or pts.shape[1] < 4:
@@ -119,7 +123,11 @@ def fit_pace(activities, overwrite=False):
 
     off = ~on & (cls >= 0)
     ratio = pace[off] / base_fn(grade[off])
-    overall = float(np.median(ratio)) if off.sum() > 10 else 1.6
+    # time adds up, so the multiplier is the mean slowdown (not the median, which the
+    # many fast off-network city/fire-road chunks would pull to ~1.0 and leave
+    # unseen terrain classes far too optimistic); clipped against GPS stops
+    ratio = np.clip(ratio, 0.3, 6.0)
+    overall = float(np.mean(ratio)) if off.sum() > 10 else 1.6
     k = models["km"].n_clusters
     mult = np.full(k, overall)
     nclass = np.zeros(k, int)
@@ -127,7 +135,7 @@ def fit_pace(activities, overwrite=False):
         m = cls[off] == c
         nclass[c] = int(m.sum())
         if m.any():
-            mult[c] = (np.median(ratio[m]) * m.sum() + overall * 20) / (m.sum() + 20)
+            mult[c] = (np.mean(ratio[m]) * m.sum() + overall * 20) / (m.sum() + 20)
     names = models["names"]
     water = [c for c in range(k) if names[c] == "water"]
     mult[water] = np.inf
@@ -263,13 +271,22 @@ class Router:
         c0, c1 = max(0, min(cols) - pad), min(w, max(cols) + pad)
         return r0, r1, c0, c1
 
-    def search(self, win, seeds_rc):
+    def search(self, win, seeds_rc, scramble=()):
+        """`scramble`: summit cells around which steep ground (a summit block the
+        26 m DEM renders as > max_slope) is allowed within SCRAMBLE_M."""
         r0, r1, c0, c1 = win
         z = np.ascontiguousarray(np.nan_to_num(self.g["z"][r0:r1, c0:c1], nan=0.0).astype(np.float64))
         w = c1 - c0
         seeds = np.array([(r - r0) * w + (c - c0) for r, c in seeds_rc], np.int64)
+        ok = self.ok[r0:r1, c0:c1].copy()
+        k = int(SCRAMBLE_M / 40)
+        zw = self.g["z"][r0:r1, c0:c1]
+        for r, c in scramble:
+            a, b = max(0, r - r0 - k), max(0, c - c0 - k)
+            aa, bb = min(r1 - r0, r - r0 + k + 1), min(c1 - c0, c - c0 + k + 1)
+            ok[a:aa, b:bb] |= np.isfinite(zw[a:aa, b:bb])
         tt, par = _dijkstra(z, np.ascontiguousarray(self.mult[r0:r1, c0:c1]),
-                            np.ascontiguousarray(self.ok[r0:r1, c0:c1]), seeds,
+                            np.ascontiguousarray(ok), seeds,
                             0, 0, self.pm["centers"], self.pm["base"], 40.0)
         return tt, par, w
 
@@ -300,10 +317,11 @@ def plan(classified, pm, max_day_s, link_km=5.0):
     todo["x"], todo["y"] = x, y
     road = grid["road"]
 
-    def access(idx_list):
+    def access(idx_list, fallback=False):
         """Least-time path road -> first peak, through all peaks in order, -> any road."""
         rcs = [todo.loc[i, "rc"] for i in idx_list]
-        win = R.window([r for r, _ in rcs], [c for _, c in rcs])
+        win = R.window([r for r, _ in rcs], [c for _, c in rcs], pad=FALLBACK_PAD if fallback else 150)
+        scr = rcs if fallback else ()
         r0, r1, c0, c1 = win
         # start/finish only on public roads >= 250 ft below the lowest summit:
         # driving to the top is not running a peak
@@ -313,19 +331,19 @@ def plan(classified, pm, max_day_s, link_km=5.0):
         if not seeds:
             return None
         legs, total, coords = [], 0.0, []
-        tt, par, w = R.search(win, seeds)
+        tt, par, w = R.search(win, seeds, scr)
         tgt = (rcs[0][0] - r0) * w + (rcs[0][1] - c0)
         if not np.isfinite(tt[tgt]):
             return None
         p = R.backtrack(par, tgt); total += tt[tgt]; legs.append(p)
         for a, b in zip(rcs[:-1], rcs[1:]):
-            tt, par, w = R.search(win, [a])
+            tt, par, w = R.search(win, [a], scr)
             tgt = (b[0] - r0) * w + (b[1] - c0)
             if not np.isfinite(tt[tgt]):
                 return None
             legs.append(R.backtrack(par, tgt)); total += tt[tgt]
         # descent: from the last summit to the nearest-by-time road cell
-        tt, par, w = R.search(win, [rcs[-1]])
+        tt, par, w = R.search(win, [rcs[-1]], scr)
         sub_idx = np.flatnonzero(sub.ravel())
         if len(sub_idx) == 0:
             return None
@@ -371,7 +389,16 @@ def plan(classified, pm, max_day_s, link_km=5.0):
         used.update(chain)
         if res_chain is not None:
             outings.append((chain, res_chain))
-    missing = [i for i in todo.index if i not in single]
+    # 3) fallback for the rest: wider window + summit scramble allowance, never chained
+    fallback = set()
+    for i in [i for i in todo.index if i not in single]:
+        res = access([i], fallback=True)
+        if res is not None:
+            outings.append(([i], res)); fallback.add(i)
+    todo["fallback"] = [i in fallback for i in todo.index]
+    missing = [i for i in todo.index if i not in single and i not in fallback]
+    if fallback:
+        print("[plan] fallback routes for:", [todo.loc[i, "name"] or f"Pt {todo.loc[i, 'elev_ft']:.0f}" for i in fallback])
     if missing:
         print("[plan] no route found for:", [todo.loc[i, "name"] or f"Pt {todo.loc[i, 'elev_ft']:.0f}" for i in missing])
     print(f"[plan] {len(todo)} peaks to go -> {len(outings)} planned outings "
@@ -401,7 +428,7 @@ def describe(outings, todo, R, models, pm, E, D, past_fps, past_names):
         names = [todo.loc[i, "name"] or f"Pt {todo.loc[i, 'elev_ft']:.0f}" for i in chain]
         rows.append({
             "route_id": k, "name": " → ".join(names), "peaks": ",".join(str(int(i)) for i in chain),
-            "n_peaks": len(chain), "dist_mi": round(dist / 1609.344, 1),
+            "n_peaks": len(chain), "fallback": bool(todo.loc[chain, "fallback"].any()), "dist_mi": round(dist / 1609.344, 1),
             "gain_ft": round(gain / 0.3048), "est_hours": round(t_s / 3600, 1),
             "off_trail_pct": round(100 * (1 - on.mean())),
             "shuttle_mi": round(float(np.hypot(x[-1] - x[0], y[-1] - y[0])) / 1609.344, 1),

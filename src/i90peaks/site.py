@@ -3,9 +3,11 @@
     build_all(classified, highway, details, caps)
 
 writes data/processed/
-    i90_app.html        the map (done peaks, my tracks, planned routes)
+    i90_app.html        the map (done peaks, my tracks, planned routes, drawing tool)
     similarity.html     the AlphaEarth route-similarity analysis + route plan
     tracks_public.geojson, planned_routes.geojson, planned_routes.gpx
+    site_seed.json      peaks (+ summit zones), published runs and summits for the
+                        family site's Supabase tables (theblacks.ai scripts/i90peaks-import.mjs)
 """
 from __future__ import annotations
 
@@ -15,6 +17,7 @@ import pickle
 import numpy as np
 from scipy.cluster.hierarchy import leaves_list, linkage
 from scipy.spatial.distance import squareform
+from shapely.geometry import Point
 
 from . import config, planner, similarity as S, terrain, tracks as T, webapp, analysis_page
 from .embeddings import Embeddings
@@ -111,6 +114,8 @@ def build_all(classified, highway, details, caps):
     planned = planned[planned.gain_ft >= 150].reset_index(drop=True)
     planned["region"] = [_region(todo.loc[int(p.split(",")[0]), "lon"]) for p in planned.peaks]
     planned["comp8"] = [_fold(c, names) for c in planned.comp]
+    planned["restricted"] = [_restricted_note(g) for g in planned.geometry]
+    classified["access_note"] = [_restricted_note(Point(lo, la)) for lo, la in zip(classified.lon, classified.lat)]
     reg_order = {name: k for k, (_, name) in enumerate(REGIONS)}
     planned = planned.sort_values(["region", "est_hours"], key=lambda s: s.map(reg_order) if s.name == "region" else s)
     planned = planned.reset_index(drop=True)
@@ -118,23 +123,29 @@ def build_all(classified, highway, details, caps):
 
     # ---- publishable layers
     pub = T.privacy_trim(tracks)
-    tracks_gj = json.loads(pub.assign(id=pub.index)[["id", "name", "date", "type", "dist_mi", "gain_ft", "geometry"]]
+    tracks_gj = json.loads(pub.assign(id=pub.index, key="strava-" + pub.act_id.astype(str))[
+        ["id", "key", "name", "date", "type", "dist_mi", "gain_ft", "geometry"]]
                            .assign(date=lambda d: d["date"].map(_date)).to_json())
-    routes_gj = json.loads(planned[["route_id", "name", "region", "n_peaks", "dist_mi", "gain_ft", "est_hours",
-                                    "off_trail_pct", "shuttle_mi", "like_run", "like_sim", "geometry"]].to_json())
+    routes_gj = json.loads(planned[["route_id", "name", "region", "n_peaks", "fallback", "dist_mi", "gain_ft", "est_hours",
+                                    "off_trail_pct", "shuttle_mi", "like_run", "like_sim", "restricted", "geometry"]].to_json())
     for f in routes_gj["features"]:
         p = f["properties"]
         p["desc"] = (f"{p['region']} · {p['dist_mi']} mi · {p['gain_ft']:,} ft · ~{p['est_hours']} h · "
                      f"{p['off_trail_pct']}% off-trail" + (f" · ends {p['shuttle_mi']} mi from start"
-                                                         if p["shuttle_mi"] >= 1 else ""))
+                                                         if p["shuttle_mi"] >= 1 else "")
+                     + (" · hand-check: no normal route (long approach or summit scramble)" if p["fallback"] else "")
+                     + (f" · crosses the {p['restricted']}" if p["restricted"] else ""))
     (config.PROCESSED / "tracks_public.geojson").write_text(json.dumps(tracks_gj))
+    _site_seed(classified, pub, config.PROCESSED / "site_seed.json")
     (config.PROCESSED / "planned_routes.geojson").write_text(json.dumps(routes_gj))
     _routes_gpx(planned, config.PROCESSED / "planned_routes.gpx")
 
+    pace = {"centers": [round(float(g), 3) for g in pm["centers"]],
+            "base": [round(float(b), 4) for b in pm["base"]], "off": round(pm["overall_off"], 2)}
     links = [{"href": SITE_SIM_URL, "label": "Route similarity (AlphaEarth) →"},
              {"href": SITE_SIM_URL + "#plan", "label": "Planned routes →"}]
     webapp.build_app(classified, highway, details=details, caps=caps, tracks=tracks_gj,
-                     routes=routes_gj, links=links)
+                     routes=routes_gj, links=links, pace=pace)
 
     done_ct = int(classified[classified.frontrow].done.sum())
     analysis_page.build({
@@ -159,6 +170,107 @@ def build_all(classified, highway, details, caps):
         "map_url": SITE_MAP_URL,
     })
     return classified
+
+
+_RESTRICTED = None
+
+
+def _restricted_note(geom):
+    """Name of the restricted area `geom` touches ('' if none)."""
+    global _RESTRICTED
+    if _RESTRICTED is None:
+        import geopandas as gpd
+        _RESTRICTED = gpd.read_file(config.RESTRICTED_GEOJSON) if config.RESTRICTED_GEOJSON.exists() else []
+    for _, a in (_RESTRICTED.iterrows() if len(_RESTRICTED) else []):
+        if a.geometry.intersects(geom):
+            return f"{a['name']} (Army: access restricted)"
+    return ""
+
+
+def summit_zones(classified):
+    """Per first-row peak, the ground that counts as 'on top': within
+    tracks.SUMMIT_RADIUS_M of the summit and within tracks.SUMMIT_DZ_M of its height
+    (the same test tracks.match applies), as a WGS84 polygon. The site matches
+    uploaded runs against these, so it needs no DEM."""
+    import rasterio
+    from rasterio.features import shapes
+    from rasterio.windows import Window
+    from shapely.geometry import shape
+    from shapely.ops import unary_union, transform as shp_transform
+    from pyproj import Transformer
+    out = {}
+    with rasterio.open(config.DEM_TIF) as dem:
+        to_dem = Transformer.from_crs("EPSG:4326", dem.crs, always_xy=True)
+        to_wgs = Transformer.from_crs(dem.crs, "EPSG:4326", always_xy=True)
+        for i, p in classified[classified.frontrow].iterrows():
+            mx, my = to_dem.transform(p.lon, p.lat)
+            r, c = dem.index(mx, my)
+            k = 12   # cells; > SUMMIT_RADIUS_M at ~26 m and the latitude stretch of 3857
+            win = Window(c - k, r - k, 2 * k + 1, 2 * k + 1)
+            z = dem.read(1, window=win, boundless=True, fill_value=-9999)
+            wt = dem.window_transform(win)
+            rr, cc = np.mgrid[0:z.shape[0], 0:z.shape[1]]
+            xs, ys = rasterio.transform.xy(wt, rr.ravel(), cc.ravel())
+            lon, lat = to_wgs.transform(np.asarray(xs), np.asarray(ys))
+            ux, uy = terrain._TO_UTM.transform(lon, lat)
+            sx, sy = terrain._TO_UTM.transform(p.lon, p.lat)
+            near = (np.hypot(ux - sx, uy - sy) <= T.SUMMIT_RADIUS_M).reshape(z.shape)
+            mask = near & (z >= p.summit_elev_m - T.SUMMIT_DZ_M)
+            if not mask.any():
+                continue
+            polys = [shape(g) for g, v in shapes(mask.astype(np.uint8), mask=mask, transform=wt) if v]
+            g = shp_transform(lambda x, y, z=None: to_wgs.transform(x, y), unary_union(polys))
+            out[int(i)] = g.simplify(0.00005).__geo_interface__
+    return out
+
+
+def _site_seed(classified, pub, path):
+    zones = summit_zones(classified)
+    peaks = []
+    for i, p in classified.iterrows():
+        peaks.append({
+            "peak_id": int(i), "name": _pname(p) if isinstance(p.get("name"), str) and p.get("name") else None,
+            "lat": round(float(p.lat), 6), "lon": round(float(p.lon), 6),
+            "elev_ft": round(float(p.elev_ft), 1), "prom_ft": round(float(p.prom_ft), 1),
+            "prom_kirmse_ft": None if not np.isfinite(p.get("prom_kirmse_ft") or np.nan) else round(float(p.prom_kirmse_ft), 1),
+            "saddle_lat": float(p.saddle_lat) if np.isfinite(p.saddle_lat) else None,
+            "saddle_lon": float(p.saddle_lon) if np.isfinite(p.saddle_lon) else None,
+            "frontrow": bool(p.frontrow), "frame_limited": bool(p.frame_limited),
+            "block_kind": p.block_kind or None, "nearest_i90_m": float(p.nearest_i90_m),
+            "summit_elev_ft": round(float(p.summit_elev_m) / 0.3048, 1),
+            "summit_zone": zones.get(int(i)),
+        })
+    tracks, summits = [], []
+    for i, r in pub.iterrows():
+        if str(r.act_id).startswith("site-"):    # uploaded on the site: already in Supabase
+            continue
+        pk = [int(x) for x in r.peaks.split(",")]
+        tracks.append({"key": f"strava-{r.act_id}", "source": "strava", "name": r["name"],
+                       "run_date": _iso(r["date"]), "dist_mi": r.dist_mi,
+                       "gain_ft": None if r.gain_ft is None or not np.isfinite(r.gain_ft) else float(r.gain_ft),
+                       "peaks": pk, "geojson": _round_geom(r.geometry.__geo_interface__)})
+        for pid in pk:
+            manual = any(classified.loc[pid, "name"] == n and r["name"] == a
+                         for n, a in config.MANUAL_SUMMITS.items())
+            summits.append({"peak_id": pid, "track_key": f"strava-{r.act_id}",
+                            "how": "manual" if manual else "gps", "summit_date": _iso(r["date"])})
+    path.write_text(json.dumps({"peaks": peaks, "tracks": tracks, "summits": summits}))
+    print(f"[site] wrote {path} ({len(peaks)} peaks, {len(zones)} summit zones, {len(tracks)} runs)")
+
+
+def _round_geom(g, nd=5):
+    def r(c):
+        return [round(c[0], nd), round(c[1], nd)] if isinstance(c[0], (int, float)) else [r(x) for x in c]
+    return {"type": g["type"], "coordinates": r(g["coordinates"])}
+
+
+def _iso(s):
+    from datetime import datetime
+    s = str(s)
+    try:
+        return datetime.fromisoformat(s.replace("Z", "+00:00")).date().isoformat()
+    except ValueError:
+        return datetime.strptime(", ".join(s.split(", ")[:2]), "%b %d, %Y").date().isoformat()
 
 
 def names_to_label(key):

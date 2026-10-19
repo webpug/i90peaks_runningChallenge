@@ -246,3 +246,19 @@ def classify(dem_path=config.DEM_TIF, highway=None, peaks=None, tol_m=TOL_M,
     print(f"[adjacency] {len(out)} peaks -> {n_fr} FIRST ROW, {len(out) - n_fr} behind")
     caps = cap_polygons(cap, transform, crs, np.arange(len(out)))
     return out, details, caps
+
+
+def exclude_far_lowland(classified, details):
+    """Drop Puget-lowland hills that are first row only because the lowland is flat
+    (summit < LOWLAND_MAX_FT and > LOWLAND_MAX_MI from I-90). They stay on the map
+    as 'behind' with block_kind 'far_lowland'; peaks behind them stay behind."""
+    out = classified.copy()
+    far = (out.frontrow & (out.elev_ft < config.LOWLAND_MAX_FT)
+           & (out.nearest_i90_m > config.LOWLAND_MAX_MI * 1609.344))
+    out.loc[far, "frontrow"] = False
+    out.loc[far, "block_kind"] = "far_lowland"
+    for i in np.flatnonzero(far.to_numpy()):
+        if i < len(details) and details[i]:
+            details[i]["kind"] = "far_lowland"   # the line still reaches the cap
+    print(f"[adjacency] {int(far.sum())} far lowland hills excluded -> {int(out.frontrow.sum())} first row")
+    return out, details

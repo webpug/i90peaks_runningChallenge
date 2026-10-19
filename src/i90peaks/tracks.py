@@ -5,13 +5,16 @@ Sources (all under data/raw/strava/):
     .gpx, .fit, .tcx(.gz)
   * CalTopo GeoJSON exports (*.json) dropped next to it, e.g. Kent_spurs.json
 
-A track is RELEVANT iff it is a human-powered, on-foot ascent (ON_FOOT types)
-and tops out on at least one first-row peak: some track point within
+  * runs uploaded through the website (CalTopo GeoJSON -> Supabase), fetched from
+    config.SITE_STATE_URL
+
+A track is RELEVANT iff it is a run (RUN_TYPES) and tops out on at least one first-row peak: some track point within
 SUMMIT_RADIUS_M of the summit that stands (on the DEM) within SUMMIT_DZ_M of the
 summit elevation -- GPS + 26 m DEM cells blur position by tens of metres, but a
 point on the summit block is still at summit height, while a trail traversing
-below the top is not. Those peaks are marked done. Lift-served skiing,
-bikes and motorised activities never count.
+below the top is not. Those peaks are marked done. Hikes, skiing (backcountry
+included), bikes and anything motorised never count. config.MANUAL_SUMMITS adds
+summits the athlete confirmed where the GPS is ambiguous.
 """
 from __future__ import annotations
 
@@ -34,7 +37,7 @@ STRAVA_DIR = config.RAW / "strava"
 TRACKS_GPKG = config.PROCESSED / "tracks_relevant.gpkg"
 SUMMIT_RADIUS_M = 120.0
 SUMMIT_DZ_M = 40 * 0.3048
-ON_FOOT = {"Run", "Trail Run", "Hike", "Walk", "Backcountry Ski", "Snowshoe", ""}
+RUN_TYPES = {"Run", "Trail Run"}
 _TO_UTM = Transformer.from_crs("EPSG:4326", "EPSG:32610", always_xy=True)
 
 
@@ -155,6 +158,28 @@ def load_all(src=STRAVA_DIR):
         for i, (name, pts, t0) in enumerate(_caltopo(p)):
             yield {"id": f"caltopo-{p.stem}-{i}", "name": name, "type": "Run",
                    "date": t0 or "", "pts": pts}
+    yield from _site_uploads()
+
+
+def _site_uploads():
+    """Runs uploaded on the website. The public state carries privacy-trimmed
+    geometry (ends and privacy zones removed), which is fine for matching summits
+    and for the similarity analysis."""
+    import requests
+    try:
+        state = requests.get(config.SITE_STATE_URL, timeout=30).json()
+    except Exception as e:      # noqa: BLE001 -- offline runs still work from local files
+        print(f"[tracks] site uploads unavailable: {e}")
+        return
+    for t in state.get("tracks", []):
+        if t.get("source") == "strava":      # already read from the export above
+            continue
+        g = t.get("geometry") or {}
+        lines = g.get("coordinates", []) if g.get("type") == "MultiLineString" else [g.get("coordinates", [])]
+        pts = [(c[0], c[1], c[2] if len(c) > 2 and c[2] is not None else np.nan,
+                c[3] / 1000 if len(c) > 3 and c[3] else np.nan) for ln in lines for c in ln]
+        yield {"id": f"site-{t['id']}", "name": t.get("name") or "Run", "type": "Run",
+               "date": t.get("run_date") or "", "pts": pts}
 
 
 # ---------------------------------------------------------------------------
@@ -179,7 +204,7 @@ def match(classified, src=STRAVA_DIR):
     for act in load_all(src):
         n_total += 1
         pts = np.asarray(act["pts"], dtype=float)
-        if len(pts) < 10 or act["type"] not in ON_FOOT:
+        if len(pts) < 10 or act["type"] not in RUN_TYPES:
             continue
         inbox = (pts[:, 0] > w) & (pts[:, 0] < e) & (pts[:, 1] > s) & (pts[:, 1] < n)
         if not inbox.any():
@@ -211,6 +236,17 @@ def match(classified, src=STRAVA_DIR):
             "geometry": LineString(pts[:, :2]).simplify(0.00003),
         })
         full[act["id"]] = pts
+    for peak_name, act_name in config.MANUAL_SUMMITS.items():
+        pid = fr.index[fr.name == peak_name]
+        row = next((r for r in rows if r["name"] == act_name), None)
+        if len(pid) == 0 or row is None:
+            print(f"[tracks] manual summit {peak_name!r} / {act_name!r} not found")
+            continue
+        pid = int(pid[0])
+        ids = sorted({int(x) for x in row["peaks"].split(",")} | {pid})
+        row["peaks"], row["n_peaks"] = ",".join(map(str, ids)), len(ids)
+        if row["date"][:12].strip() not in done_by.get(pid, []):
+            done_by.setdefault(pid, []).append(row["date"][:12].strip())
     tracks = gpd.GeoDataFrame(rows, geometry="geometry", crs="EPSG:4326")
     out = classified.copy()
     out["done"] = [i in done_by for i in out.index]

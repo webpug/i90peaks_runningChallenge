@@ -37,6 +37,7 @@ def main():
 
     print("\n==[6/7] first-row classification (summit caps + approaches) ==")
     classified, details, caps = adjacency.classify(dem_path=config.DEM_TIF, highway=hw, peaks=ours)
+    classified, details = adjacency.exclude_far_lowland(classified, details)
     classified.to_file(config.RESULT_GPKG, driver="GPKG")
     caps.to_file(config.CAPS_GPKG, driver="GPKG")
     with open(config.DETAILS_PKL, "wb") as fh:

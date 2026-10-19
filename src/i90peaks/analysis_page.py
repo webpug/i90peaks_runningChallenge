@@ -288,7 +288,7 @@ function plan(){
   let reg='';
   P.forEach(r=>{
     if(r.region!==reg){reg=r.region;const n=P.filter(x=>x.region===reg);h+=`<tr class="region"><td colspan="8">${esc(reg)} · ${n.length} outings · ${n.reduce((a,x)=>a+x.n_peaks,0)} peaks</td></tr>`;}
-    h+=`<tr><td><b>${esc(r.name)}</b>${r.shuttle_mi>=1?`<br><span class="flag">ends ${r.shuttle_mi} mi from start</span>`:''}${r.new_terrain?`<br><span class="flag">new off-trail terrain for me</span>`:''}</td>
+    h+=`<tr><td><b>${esc(r.name)}</b>${r.shuttle_mi>=1?`<br><span class="flag">ends ${r.shuttle_mi} mi from start</span>`:''}${r.new_terrain?`<br><span class="flag">new off-trail terrain for me</span>`:''}${r.fallback?`<br><span class="flag">hand-check: long approach or summit scramble</span>`:''}${r.restricted?`<br><span class="flag">⚠ ${esc(r.restricted)}</span>`:''}</td>
       <td class="n">${r.dist_mi}</td><td class="n">${fmt(r.gain_ft)}′</td><td class="n">${r.est_hours} h</td><td class="n hide-sm">${r.off_trail_pct}%</td>
       <td class="hide-sm" style="min-width:110px">${`<div class="stack">${r.comp8.map((v,k)=>v>0.004?`<i title="${D.groups[k].label}: ${Math.round(v*100)}%" style="width:${v*100}%;background:${gcol(D.groups[k])}"></i>`:'').join('')}</div>`}</td>
       <td class="hide-sm" style="font-size:12px;color:var(--ink2)">${r.like_run&&r.like_sim>=0.3?esc(r.like_run)+` <span style="color:var(--muted)">(${r.like_sim})</span>`:'<span style="color:var(--accent)">unlike anything I\'ve run yet</span>'}</td>
@@ -299,7 +299,7 @@ function plan(){
 }
 function pace(){
   const P=D.pace;
-  $('#paceSub').innerHTML=`Fit from ${fmt(P.n_chunks)} 100 m pieces of my timed runs and hikes in the corridor (${fmt(P.n_off)} of them off-trail). Grade comes from the terrain model, not the watch, and "off-trail" means more than 25 m from any mapped trail or road. Overall I move <b>${P.overall_off}×</b> slower off-trail; the planner never routes over ground steeper than <b>${P.max_slope}°</b>.`;
+  $('#paceSub').innerHTML=`Fit from ${fmt(P.n_chunks)} 100 m pieces of my timed runs in the corridor (${fmt(P.n_off)} of them off-trail). Grade comes from the terrain model, not the watch, and "off-trail" means more than 25 m from any mapped trail or road. On average I move <b>${P.overall_off}×</b> slower off-trail (mean, since time adds up); the planner never routes over ground steeper than <b>${P.max_slope}°</b>.`;
   // line chart
   const W=520,H=260,l=46,b=34,t=12,r=12;
   const xs=P.grade, ys=P.min_per_mi, x0=xs[0],x1=xs[xs.length-1], ymax=Math.ceil(Math.max(...ys)/10)*10;
